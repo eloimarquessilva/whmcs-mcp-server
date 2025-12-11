@@ -1,0 +1,17 @@
+{
+  "tool": "get_invoice",
+  "description": "Get invoice details - should return invoice with items",
+  "input": {
+    "invoiceid": 1
+  },
+  "expected_output_shape": {
+    "invoiceid": "number",
+    "status": "string",
+    "total": "string",
+    "items": "array"
+  },
+  "error_case": {
+    "input": { "invoiceid": 999999 },
+    "expected": { "isError": true }
+  }
+}
