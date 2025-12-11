@@ -1,0 +1,14 @@
+{
+  "tool": "search_clients",
+  "description": "Search for clients by email - should return matching results",
+  "input": {
+    "search": "test@example.com",
+    "limit": 10
+  },
+  "expected_output": {
+    "clients": [],
+    "total": 0,
+    "success": true
+  },
+  "notes": "Empty result is valid - actual data depends on WHMCS instance"
+}

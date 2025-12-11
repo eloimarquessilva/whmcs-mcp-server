@@ -1,0 +1,20 @@
+{
+  "tool": "check_domain_availability",
+  "description": "Check valid domain availability",
+  "cases": [
+    {
+      "input": { "domain": "google.com" },
+      "expected_shape": { "domain": "string", "available": "boolean" }
+    },
+    {
+      "input": { "domain": "пример.рф" },
+      "expected_shape": { "domain": "string" },
+      "notes": "IDN domain - should be accepted"
+    },
+    {
+      "input": { "domain": "xn--e1afmkfd.xn--p1ai" },
+      "expected_shape": { "domain": "string" },
+      "notes": "Punycode domain - should be accepted"
+    }
+  ]
+}

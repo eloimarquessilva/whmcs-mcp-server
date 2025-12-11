@@ -1,0 +1,13 @@
+{
+  "tool": "record_refund",
+  "description": "Large refund without confirmation - should require confirmation",
+  "input": {
+    "invoiceid": 1,
+    "amount": 5000,
+    "refund_type": "Credit"
+  },
+  "expected": {
+    "requires_confirmation": true,
+    "warning": "Amount exceeds $1000 threshold"
+  }
+}
