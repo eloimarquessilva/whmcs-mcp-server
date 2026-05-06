@@ -6,8 +6,19 @@ dist/
 
 # Environment variables
 .env
-.env.local
-.env.*.local
+.env.*
+!.env.example
+
+# MCP client config files (may contain credentials)
+cursor-mcp-config.json
+*-mcp-config.json
+
+# Local security notes
+docs/security-risk-assessment.md
+
+# Local agent workspaces and workflows
+.agents/
+.codex/
 
 # Logs
 *.log

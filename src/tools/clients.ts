@@ -50,7 +50,13 @@ interface WhmcsClientDetails {
   defaultgateway?: string;
   numproducts?: number;
   numdomains?: number;
-  customfields?: Array<{ id: number; value: string }>;
+  customfields?: Array<{
+    id: number;
+    name?: string;
+    label?: string;
+    fieldname?: string;
+    value: string;
+  }>;
 }
 
 /**
@@ -97,11 +103,15 @@ function generateSecurePassword(length: number = 16): string {
     password += allChars[bytes[i] % allChars.length];
   }
   
-  // Combine and shuffle
-  const combined = required.join('') + password;
-  const shuffled = combined.split('').sort(() => Math.random() - 0.5).join('');
-  
-  return shuffled;
+  // Combine and shuffle using Fisher-Yates with cryptographically secure randomness
+  const combined = (required.join('') + password).split('');
+  const shuffleBytes = crypto.randomBytes(combined.length);
+  for (let i = combined.length - 1; i > 0; i--) {
+    const j = shuffleBytes[i] % (i + 1);
+    [combined[i], combined[j]] = [combined[j], combined[i]];
+  }
+
+  return combined.join('');
 }
 
 /**
@@ -345,7 +355,7 @@ export function registerClientTools(
   if (isToolAllowed('search_clients')) {
     server.tool(
       'search_clients',
-      `Search for WHMCS clients by name, email, or company. Returns minimal summary. Version: ${TOOL_VERSION}`,
+      `Search WHMCS customers/clients by name, email, or company. Use this when the user asks about customers, accounts, client identity, or finding a WHMCS client before looking up details, services, invoices, tickets, or domains. Returns a minimal summary. Version: ${TOOL_VERSION}`,
       { ...searchClientsSchema.shape, ...AUTH_SHAPE },
       async (params) => {
         const toolLogger = logger.child();
@@ -422,7 +432,7 @@ export function registerClientTools(
   if (isToolAllowed('get_client_details')) {
     server.tool(
       'get_client_details',
-      `Get full details for a specific WHMCS client including credit balance and custom fields. Version: ${TOOL_VERSION}`,
+      `Get full WHMCS customer/client details for a specific client, including contact data, status, credit balance, product/domain counts, payment gateway, and custom fields. Use after search_clients or invoice reports when the user needs deeper client profile data. Version: ${TOOL_VERSION}`,
       { ...getClientDetailsSchema.shape, ...AUTH_SHAPE },
       async (params) => {
         const toolLogger = logger.child();
@@ -448,9 +458,24 @@ export function registerClientTools(
           });
           
           // Normalize custom fields
-          const customfields = normalizeToArray<{ id: number; value: string }>(
+          const customfields = normalizeToArray<{
+            id: number;
+            name?: string;
+            label?: string;
+            fieldname?: string;
+            value: string;
+          }>(
             result.customfields
-          ).map((cf) => ({ id: cf.id, value: cf.value }));
+          ).map((cf) => {
+            const configuredLabel = config.MCP_CLIENT_CUSTOM_FIELD_LABELS[String(cf.id)];
+            const label = cf.label || cf.name || cf.fieldname || configuredLabel || null;
+            return {
+              id: cf.id,
+              label,
+              name: label,
+              value: cf.value,
+            };
+          });
           
           toolLogger.logToolResult('get_client_details', true, Date.now() - startTime);
           
@@ -516,6 +541,7 @@ export function registerClientTools(
       country: z.string().optional(),
       phonenumber: z.string().optional(),
       notes: z.string().optional(),
+      confirm: z.boolean().default(false).describe('Must be true to apply the update'),
     });
     
     server.tool(
@@ -534,6 +560,21 @@ export function registerClientTools(
             return clientModeDenied('update_client');
           }
 
+          if (!params.confirm) {
+            const previewFields = Object.entries(params)
+              .filter(([k, v]) => !['clientid', 'confirm', 'auth_token'].includes(k) && v !== undefined)
+              .map(([k]) => k);
+            return {
+              content: [{ type: 'text' as const, text: JSON.stringify({
+                isError: true,
+                error: 'Confirmation required. Re-submit with confirm=true to apply the update.',
+                clientid: params.clientid,
+                fields_to_update: previewFields,
+              }) }],
+              isError: true,
+            };
+          }
+
           toolLogger.logToolCall('update_client', params, true);
           
           if (!rateLimiter.tryConsume()) {
@@ -547,7 +588,7 @@ export function registerClientTools(
             };
           }
           
-          const { clientid, ...updateFields } = params;
+          const { clientid, confirm: _confirm, ...updateFields } = params;
           
           // Sanitize text inputs
           const sanitizedFields: Record<string, string | undefined> = {};
@@ -609,7 +650,7 @@ export function registerClientTools(
     
     server.tool(
       'get_service_details',
-      `Get detailed information about a client's service/product. Version: ${TOOL_VERSION}`,
+      `Get detailed WHMCS hosting/service/product information for a client's service, including status, billing cycle, next due date, recurring amount, server, custom fields, and config options. Use for questions about customer services, hosting accounts, subscriptions, renewals, and service status. Version: ${TOOL_VERSION}`,
       { ...getServiceDetailsSchema.shape, ...AUTH_SHAPE },
       async (params) => {
         const toolLogger = logger.child();

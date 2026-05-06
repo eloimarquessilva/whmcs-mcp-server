@@ -6,8 +6,8 @@
 import { config as loadEnv } from 'dotenv';
 import { z } from 'zod';
 
-// Load .env file
-loadEnv();
+// Load .env file without writing tips to stdout, which breaks MCP stdio.
+loadEnv({ quiet: true });
 
 /**
  * MCP operation modes
@@ -19,7 +19,26 @@ export type McpMode = 'read_only' | 'simulate' | 'full';
  */
 const configSchema = z.object({
   // WHMCS API Configuration
-  WHMCS_API_URL: z.string().min(1, 'WHMCS_API_URL is required'),
+  WHMCS_API_URL: z.string().min(1, 'WHMCS_API_URL is required').refine(
+    (url) => {
+      try {
+        const parsed = new URL(url);
+        if (parsed.protocol !== 'https:') return false;
+        const host = parsed.hostname.toLowerCase();
+        // Block loopback and cloud metadata endpoints
+        const blocked = ['localhost', '127.0.0.1', '::1', '0.0.0.0', '169.254.169.254'];
+        if (blocked.includes(host)) return false;
+        // Block RFC-1918 private ranges
+        if (/^10\.\d+\.\d+\.\d+$/.test(host)) return false;
+        if (/^172\.(1[6-9]|2\d|3[01])\.\d+\.\d+$/.test(host)) return false;
+        if (/^192\.168\.\d+\.\d+$/.test(host)) return false;
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    { message: 'WHMCS_API_URL must be a valid https:// URL and must not target private or internal hosts' }
+  ),
   WHMCS_IDENTIFIER: z.string().min(1, 'WHMCS_IDENTIFIER is required'),
   WHMCS_SECRET: z.string().min(1, 'WHMCS_SECRET is required'),
   WHMCS_ACCESS_KEY: z.preprocess(
@@ -58,6 +77,27 @@ const configSchema = z.object({
       return String(val).split(',').map((s) => s.trim()).filter(Boolean);
     },
     z.array(z.string()).default([])
+  ),
+  MCP_CLIENT_CUSTOM_FIELD_LABELS: z.preprocess(
+    (val) => {
+      if (!val || val === '') return {};
+      return Object.fromEntries(
+        String(val)
+          .split(',')
+          .map((entry) => entry.trim())
+          .filter(Boolean)
+          .map((entry) => {
+            const separatorIndex = entry.indexOf(':');
+            if (separatorIndex === -1) return null;
+            const id = Number.parseInt(entry.slice(0, separatorIndex).trim(), 10);
+            const label = entry.slice(separatorIndex + 1).trim();
+            if (!Number.isFinite(id) || id <= 0 || !label) return null;
+            return [String(id), label] as const;
+          })
+          .filter((entry): entry is readonly [string, string] => entry !== null)
+      );
+    },
+    z.record(z.string(), z.string()).default({})
   ),
 }).superRefine((val, ctx) => {
   if (val.MCP_ACCESS_MODE === 'client' && val.MCP_ALLOWED_CLIENT_IDS.length === 0) {
