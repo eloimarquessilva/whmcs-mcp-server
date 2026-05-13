@@ -407,9 +407,9 @@ async function compositeRefund(invoiceid, amount) {
 
 #### Tool: `get_client_details`
 
-**Inputs:** `clientid` (required)
+**Inputs:** `clientid` for a single client, `clientid` as an array, or `clientids` array for multiple clients
 
-**Return:** Full client details including credit balance, product/domain counts, custom fields
+**Return:** Full client details including credit balance, product/domain counts, custom fields. Multiple-client requests return `{ clients, total }`.
 
 **isMutating:** `false`
 

@@ -130,7 +130,7 @@ Add to your Cursor MCP settings (`~/.cursor/mcp.json`):
 
 - `create_client` - Create or reuse existing client by email
 - `search_clients` - Search clients by name/email/company
-- `get_client_details` - Get full client details
+- `get_client_details` - Get full client details for one or more clients
 - `update_client` - Update client details
 - `get_service_details` - Get detailed service information
 
