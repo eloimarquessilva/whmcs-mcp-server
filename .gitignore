@@ -43,3 +43,4 @@ deploy/whmcs-test/snapshot/*
 # Prod-derived DB dumps (raw + scrubbed) + prod config — NEVER committed.
 # Raw is deleted right after scrubbing; only scrubbed data enters containers.
 deploy/whmcs-test/.prodseed/
+cursor-mcp-config.json

@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "whmcs": {
+      "command": "node",
+      "args": ["/absolute/path/to/whmcs-mcp-server/dist/index.js"],
+      "env": {
+        "WHMCS_API_URL": "https://your-whmcs.example.com",
+        "WHMCS_IDENTIFIER": "replace-me",
+        "WHMCS_SECRET": "replace-me",
+        "MCP_MODE": "read_only",
+        "MCP_DEBUG": "false"
+      }
+    }
+  }
+}
