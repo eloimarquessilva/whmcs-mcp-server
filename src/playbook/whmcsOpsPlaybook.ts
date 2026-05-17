@@ -5,7 +5,7 @@
  * Exposed as an MCP resource at whmcs://docs/ops-playbook
  */
 
-import { McpServer, ResourceTemplate } from '@modelcontextprotocol/sdk/server/mcp.js';
+import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { Logger } from '../logging.js';
 import { ensureResourceAuth, stripAuthFromUri } from '../security.js';
 
@@ -116,7 +116,7 @@ export function registerPlaybookResource(
   // Register the playbook as a static resource
   server.resource(
     'ops-playbook',
-    new ResourceTemplate('whmcs://docs/ops-playbook{?token,auth_token}', { list: undefined }),
+    'whmcs://docs/ops-playbook',
     async (uri) => {
       logger.debug('Fetching ops-playbook resource');
 

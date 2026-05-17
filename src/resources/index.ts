@@ -45,7 +45,7 @@ export function registerResources(
   // ============================================
   server.resource(
     'client-summary',
-    new ResourceTemplate('whmcs://clients/{clientid}/summary{?token,auth_token}', { list: undefined }),
+    new ResourceTemplate('whmcs://clients/{clientid}/summary', { list: undefined }),
     async (uri, params) => {
       const resourceLogger = logger.child();
       const safeUri = stripAuthFromUri(uri);
@@ -133,7 +133,7 @@ export function registerResources(
   // ============================================
   server.resource(
     'invoice-history',
-    new ResourceTemplate('whmcs://invoices/{invoiceid}/history{?token,auth_token}', { list: undefined }),
+    new ResourceTemplate('whmcs://invoices/{invoiceid}/history', { list: undefined }),
     async (uri, params) => {
       const resourceLogger = logger.child();
       const safeUri = stripAuthFromUri(uri);
@@ -239,7 +239,7 @@ export function registerResources(
   // ============================================
   server.resource(
     'ticket-thread',
-    new ResourceTemplate('whmcs://tickets/{ticketid}/thread{?token,auth_token}', { list: undefined }),
+    new ResourceTemplate('whmcs://tickets/{ticketid}/thread', { list: undefined }),
     async (uri, params) => {
       const resourceLogger = logger.child();
       const safeUri = stripAuthFromUri(uri);
@@ -357,7 +357,7 @@ export function registerResources(
   // ============================================
   server.resource(
     'client-log',
-    new ResourceTemplate('whmcs://clients/{clientid}/log{?token,auth_token}', { list: undefined }),
+    new ResourceTemplate('whmcs://clients/{clientid}/log', { list: undefined }),
     async (uri, params) => {
       const resourceLogger = logger.child();
       const safeUri = stripAuthFromUri(uri);
@@ -503,7 +503,7 @@ export function registerResources(
   // ============================================
   server.resource(
     'system-activity',
-    new ResourceTemplate('whmcs://system/activity{?token,auth_token}', { list: undefined }),
+    'whmcs://system/activity',
     async (uri) => {
       const resourceLogger = logger.child();
       const safeUri = stripAuthFromUri(uri);
