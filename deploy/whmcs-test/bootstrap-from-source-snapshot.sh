@@ -9,13 +9,15 @@
 # modifies that repo. Patches $db_host (their mariadb8/9 → our mcpw{8,9}-db)
 # then delegates to reset.sh (the proven non-wizard restore).
 #
-# Usage: deploy/whmcs-test/bootstrap-from-source-snapshot.sh [mcpw8|mcpw9|all]
+# Usage: WMCP_SRC_SNAPSHOT=/path/to/securiace-vps-platform/deploy/whmcs-test/snapshot \
+#          deploy/whmcs-test/bootstrap-from-source-snapshot.sh [mcpw8|mcpw9|all]
+# WMCP_SRC_SNAPSHOT is REQUIRED — no machine-specific path is baked in.
 
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 HERE="$REPO_ROOT/deploy/whmcs-test"
-SRC_SNAP="${WMCP_SRC_SNAPSHOT:-/Users/kritananda/Projects/securiace-vps-platform/deploy/whmcs-test/snapshot}"
+SRC_SNAP="${WMCP_SRC_SNAPSHOT:?Set WMCP_SRC_SNAPSHOT=/path/to/securiace-vps-platform/deploy/whmcs-test/snapshot (required)}"
 target="${1:-all}"
 
 [[ -d "$SRC_SNAP" ]] || { echo "ERROR: source snapshot not found at $SRC_SNAP" >&2; exit 1; }

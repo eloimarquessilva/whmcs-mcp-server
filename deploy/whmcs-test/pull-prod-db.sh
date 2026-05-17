@@ -7,18 +7,21 @@
 # The raw (unscrubbed) dump is deleted by seed-from-prod.sh right after
 # scrubbing — it must never persist or be committed.
 #
-# Usage: deploy/whmcs-test/pull-prod-db.sh
-# Override host/path via PROD_SSH / PROD_WHMCS_DIR env.
+# Usage: PROD_SSH=user@host PROD_WHMCS_DIR=/path/to/whmcs \
+#          deploy/whmcs-test/pull-prod-db.sh
+# PROD_SSH and PROD_WHMCS_DIR are REQUIRED — no prod host/path defaults are
+# baked into this tracked script. PROD_WHMCS_PATH is accepted as an alias
+# for PROD_WHMCS_DIR.
 
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 PRODSEED="$REPO_ROOT/deploy/whmcs-test/.prodseed"
-PROD_SSH="${PROD_SSH:-root@195.7.4.219}"
-PROD_WHMCS_DIR="${PROD_WHMCS_DIR:-/var/www/my_securiace_usr/data/www/my.securiace.com}"
+PROD_SSH="${PROD_SSH:?Set PROD_SSH=user@prod-host (required; do not hardcode prod)}"
+PROD_WHMCS_DIR="${PROD_WHMCS_DIR:-${PROD_WHMCS_PATH:?Set PROD_WHMCS_DIR=/path/to/whmcs on prod (or PROD_WHMCS_PATH); required}}"
 # A dump the operator prepared on prod (preferred — exact live DB). When
 # present we just fetch it; no live mysqldump / config parsing needed.
-PROD_DUMP_REMOTE_PATH="${PROD_DUMP_REMOTE_PATH:-~/my_securiace_db.sql}"
+PROD_DUMP_REMOTE_PATH="${PROD_DUMP_REMOTE_PATH:-~/whmcs_db.sql}"
 SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=15 -o StrictHostKeyChecking=accept-new)
 
 mkdir -p "$PRODSEED"
@@ -90,15 +93,17 @@ for h in $CANDS; do
 done
 RP
 
-# --- Call A: fetch only what the local seeder needs (cc hash/license/db
-#     name), base64'd, written to a 600 gitignored file, never printed. ---
-echo "==> Reading prod WHMCS DB metadata (cc_encryption_hash/license/db) ..."
+# --- Call A: fetch only license + db name (NOT the prod cc_encryption_hash).
+#     tblcreditcards is truncated by scrub-pii.sql, so there is nothing to
+#     decrypt — Mode B generates a fresh local hash exactly like Mode A and
+#     never transfers prod's real encryption key. base64'd, written to a
+#     600 gitignored file, never printed. ---
+echo "==> Reading prod WHMCS DB metadata (license/db name only) ..."
 META_B64="$(ssh "${SSH_OPTS[@]}" "$PROD_SSH" \
   "PROD_WHMCS_DIR='$PROD_WHMCS_DIR' bash -s" <<RPA 2>/dev/null || true
 $REMOTE_PARSE
-CCH="\$(pv cc_encryption_hash)"; LIC="\$(pv license)"
-printf 'PROD_CC_HASH=%s\nPROD_LICENSE=%s\nPROD_DB_NAME=%s\n' \
-  "\$(printf %s "\$CCH" | base64 | tr -d '\n')" \
+LIC="\$(pv license)"
+printf 'PROD_LICENSE=%s\nPROD_DB_NAME=%s\n' \
   "\$(printf %s "\$LIC" | base64 | tr -d '\n')" \
   "\$(printf %s "\$DBN" | base64 | tr -d '\n')" | base64 | tr -d '\n'
 RPA
@@ -113,8 +118,13 @@ umask 077
     [[ -n "$k" ]] && printf "%s='%s'\n" "$k" "$(printf %s "$v" | base64 --decode)"
   done < <(printf %s "$META_B64" | base64 --decode)
 } > "$PRODSEED/prod-config.env"
+# Mode B never carries prod's real cc_encryption_hash: generate a fresh
+# local one (cards are truncated by scrub-pii.sql → nothing to decrypt).
+GEN_CC_HASH="$(LC_ALL=C tr -dc 'a-f0-9' </dev/urandom | head -c 32)"
+printf "PROD_CC_HASH='%s'\n" "$GEN_CC_HASH" >> "$PRODSEED/prod-config.env"
 chmod 600 "$PRODSEED/prod-config.env"
 echo "    metadata captured (values not printed; stored 600, gitignored)"
+echo "    cc_encryption_hash generated locally (prod key NOT transferred)"
 
 # --- Call B: host-fallback mysqldump, gzip on the wire, creds stay on prod ---
 echo "==> mysqldump prod DB (single-transaction, read-only) → raw.sql.gz ..."

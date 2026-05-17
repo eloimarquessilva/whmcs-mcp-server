@@ -2,10 +2,13 @@
 -- scrub-pii.sql — applied to a DISPOSABLE staging DB loaded from the raw
 -- prod dump, BEFORE any data is loaded into the local WHMCS containers.
 --
--- Mandated (user): replace ALL emails + phone numbers with dummies.
+-- Mandated (user): replace ALL emails + phone numbers with dummies AND
+-- anonymize client/contact names, companies, addresses, tax ids, ticket
+-- requester names, and ALL custom field values. No real client identity
+-- data is retained.
 -- Best practice (user-approved): neutralize secrets, truncate sensitive
--- logs / card data, reset admin to a known dev login. Real client
--- names/addresses are intentionally KEPT for realistic demo data.
+-- logs / card data / API device credentials, reset admin to a known dev
+-- login.
 --
 -- Idempotent (safe to re-run). __ADMIN_PWHASH__ is substituted by
 -- seed-from-prod.sh with a freshly computed bcrypt hash.
@@ -32,6 +35,27 @@ UPDATE tblticketreplies SET email = CONCAT('dev+tr', id, '@example.test')
 UPDATE tbltickets   SET email = CONCAT('dev+tk', id, '@example.test')
                        WHERE email IS NOT NULL AND email <> '';
 
+-- ---- ANONYMIZE names / companies / addresses / tax ids ----
+-- Deterministic by id (distinct entities still look distinct, but fake).
+-- Kept as SEPARATE single-purpose statements so a column that is absent on
+-- a given WHMCS minor (skipped under --force) cannot cause the identity
+-- columns to go un-scrubbed.
+UPDATE tblclients  SET firstname = CONCAT('Client', id), lastname = 'Test';
+UPDATE tblclients  SET companyname = CONCAT('Test Co ', id);
+UPDATE tblclients  SET address1 = CONCAT('Addr ', id), address2 = '',
+                       city = 'Testville', state = 'TS', postcode = '00000';
+UPDATE tblclients  SET taxid = '';   -- optional column
+UPDATE tblclients  SET notes = '';   -- optional column (admin notes)
+UPDATE tblcontacts SET firstname = CONCAT('Contact', id), lastname = 'Test';
+UPDATE tblcontacts SET companyname = CONCAT('Test Co ', id);
+UPDATE tblcontacts SET address1 = CONCAT('Addr ', id), address2 = '',
+                       city = 'Testville', state = 'TS', postcode = '00000';
+UPDATE tblusers    SET firstname = CONCAT('User', id), lastname = 'Test';
+UPDATE tbltickets  SET name = CONCAT('Requester', id)
+                       WHERE name IS NOT NULL AND name <> '';
+-- Custom field values can hold arbitrary submitted PII → blank all.
+UPDATE tblcustomfieldsvalues SET value = '' WHERE value <> '';
+
 -- ---- TRUNCATE high-risk PII / secret logs + card data ----
 TRUNCATE TABLE tblcreditcards;
 TRUNCATE TABLE tblemails;
@@ -39,6 +63,8 @@ TRUNCATE TABLE tblgatewaylog;
 TRUNCATE TABLE tblactivitylog;
 TRUNCATE TABLE tbladminlog;
 TRUNCATE TABLE tblapilog;
+TRUNCATE TABLE tbldeviceauth;   -- modern WHMCS API credential store (prod identifiers + bcrypt secrets)
+TRUNCATE TABLE tblnotes;        -- free-text client notes may contain PII
 
 -- ---- Blank gateway / server / config secrets ----
 UPDATE tblpaymentgateways
@@ -74,7 +100,10 @@ DELETE FROM tbladmins
   WHERE id <> (SELECT mid FROM (SELECT MIN(id) AS mid FROM tbladmins) z);
 
 -- ---- Let the External API authenticate from localhost ----
--- tblapi_credentials exists once prod has created API credentials.
+-- tbldeviceauth (the modern API credential store) is TRUNCATED above, so
+-- prod API identifiers/secrets never reach the local DB. Local dev must
+-- mint a fresh credential (see replicate-cred.sh). The legacy
+-- tblapi_credentials (older minors) only needs its IP allowlist cleared.
 UPDATE tblapi_credentials SET ip_restriction = '' WHERE 1 = 1;
 
 -- ---- Disable CAPTCHA for local dev (decompiled captcha.tpl shows the

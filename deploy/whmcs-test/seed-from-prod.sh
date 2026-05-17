@@ -76,15 +76,31 @@ TMP_SQL="$(mktemp)"
 "${DC[@]}" exec -T mcpw8-db mariadb -uroot -prootsecret_8 --force whmcs_stage < "$TMP_SQL"
 rm -f "$TMP_SQL"
 
-# Mandated-scrub assertion: zero real-looking emails left in tblclients.
-leak="$(mysql8 -N -B whmcs_stage -e \
-  "SELECT COUNT(*) FROM tblclients WHERE email NOT LIKE 'dev+%@example.test' AND email <> '';" 2>/dev/null | tr -d '\r')"
+# Post-scrub assertion (FAIL-CLOSED): no real PII/credentials may remain.
+# Covers emails (clients/contacts/users), phones, anonymized names, custom
+# field values, and the API device-credential store. If any table/column is
+# missing the query errors → empty result → treated as failure (we never
+# load prod-derived data on doubt).
+leak="$(mysql8 -N -B whmcs_stage -e "
+  SELECT
+    (SELECT COUNT(*) FROM tblclients  WHERE email NOT LIKE 'dev+%@example.test'  AND email <> '') +
+    (SELECT COUNT(*) FROM tblcontacts WHERE email NOT LIKE 'dev+c%@example.test' AND email <> '') +
+    (SELECT COUNT(*) FROM tblusers    WHERE email NOT LIKE 'dev+u%@example.test' AND email <> '') +
+    (SELECT COUNT(*) FROM tblclients  WHERE phonenumber NOT IN ('+10000000000','')) +
+    (SELECT COUNT(*) FROM tblcontacts WHERE phonenumber NOT IN ('+10000000000','')) +
+    (SELECT COUNT(*) FROM tblclients  WHERE firstname NOT LIKE 'Client%') +
+    (SELECT COUNT(*) FROM tblcontacts WHERE firstname NOT LIKE 'Contact%') +
+    (SELECT COUNT(*) FROM tblclients  WHERE address1  NOT LIKE 'Addr %') +
+    (SELECT COUNT(*) FROM tblcustomfieldsvalues WHERE value <> '') +
+    (SELECT COUNT(*) FROM tbldeviceauth);" 2>/dev/null | tr -d '\r')"
 if [[ "${leak:-1}" != "0" ]]; then
-  echo "ERROR: scrub assertion failed — $leak un-scrubbed client emails remain. Aborting (no data loaded)." >&2
+  echo "ERROR: scrub assertion failed — ${leak:-<query error>} PII/credential rows remain" >&2
+  echo "       (checked: emails clients/contacts/users, phones, names, addresses, custom fields, tbldeviceauth)." >&2
+  echo "       Aborting — no prod-derived data loaded into the WHMCS containers." >&2
   mysql8 -e "DROP DATABASE IF EXISTS whmcs_stage;" || true
   exit 1
 fi
-echo "    scrub OK (tblclients emails all dev+*@example.test)"
+echo "    scrub OK (emails, phones, names, addresses, custom fields, tbldeviceauth all clean)"
 
 # --- 3. export scrubbed, DELETE raw -----------------------------------------
 echo "==> Exporting scrubbed.sql and DELETING the raw prod dump ..."
