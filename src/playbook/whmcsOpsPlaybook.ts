@@ -7,7 +7,7 @@
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { Logger } from '../logging.js';
-import { ensureResourceAuth, stripAuthFromUri } from '../security.js';
+import { stripAuthFromUri } from '../security.js';
 
 /**
  * The WHMCS Operations Playbook content
@@ -120,9 +120,6 @@ export function registerPlaybookResource(
     async (uri) => {
       logger.debug('Fetching ops-playbook resource');
 
-      const authResult = ensureResourceAuth(uri);
-      if (!authResult.ok) return authResult.response;
-      
       return {
         contents: [
           {

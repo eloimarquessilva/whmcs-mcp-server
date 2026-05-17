@@ -93,7 +93,7 @@ cp .env.example .env
 | `MCP_MODE`           | `read_only` | Operation mode: `read_only`, `simulate`, `full` |
 | `MCP_ACCESS_MODE`    | `admin`     | Access mode: `admin` (full) or `client` (scoped) |
 | `MCP_ALLOWED_CLIENT_IDS` | (empty) | Comma-separated client IDs allowed in `client` mode |
-| `MCP_AUTH_TOKEN`     | (empty)     | Optional shared secret required by tools/resources |
+| `MCP_AUTH_TOKEN`     | (empty)     | Optional shared secret required on tool calls (`auth_token` param). Not used for resource reads. |
 | `MCP_RATE_LIMIT`     | `10`        | Max WHMCS API calls per second                  |
 | `MCP_DEBUG`          | `false`     | Enable verbose logging                          |
 | `MCP_MAX_PAGE_SIZE`  | `100`       | Maximum pagination size                         |
@@ -174,8 +174,8 @@ Add to your Cursor MCP settings (`~/.cursor/mcp.json`):
 
 ## Authentication & Access Modes
 
-### Shared-Secret Auth (Optional)
-If `MCP_AUTH_TOKEN` is set, every tool call must include `auth_token`, and every resource URI must include `?token=...`.
+### Shared-Secret Auth (Optional, tool calls only)
+If `MCP_AUTH_TOKEN` is set, every tool call must include an `auth_token` parameter that matches it. This applies to **tool calls only**.
 
 Example tool call payload:
 ```json
@@ -185,10 +185,13 @@ Example tool call payload:
 }
 ```
 
-Example resource URI:
-```
-whmcs://clients/123/summary?token=your_shared_secret
-```
+**Resources are not authenticated via a URI-query token.** This server speaks
+MCP over **stdio**, so the process that launches it is the trust boundary, and
+the MCP SDK's `$`-anchored URI matching makes a `?token=` query on resource
+URIs unworkable (the read would 404 before any auth code runs). MCP resources
+are instead protected by process/transport isolation plus the access-mode and
+client-scope guardrails below. Keep `MCP_AUTH_TOKEN`, `WHMCS_*` secrets, and
+local config files out of version control.
 
 ### Access Modes
 This server always uses WHMCS **admin** API credentials under the hood. `MCP_ACCESS_MODE=client` adds an extra guardrail layer to prevent cross-client access and admin actions.
@@ -312,7 +315,7 @@ To confirm read-only tools and resources work against a real WHMCS instance from
 1. **Prerequisites:** Run `npm run build` so `dist/index.js` exists. Ensure Cursor is using this project's MCP server (e.g. copy [cursor-mcp-config.json](cursor-mcp-config.json) into **Cursor Settings → MCP → Edit config**). If WHMCS has an API IP allowlist, ensure the machine running Cursor is allowed.
 2. **Read-only tools to try:** `list_products`, `get_ticket_departments`, `check_domain_availability`, `search_clients` (admin mode), `get_client_details`, `get_invoice`, `get_service_details` (use real IDs from your WHMCS).
 3. **Resources to try:** `whmcs://docs/ops-playbook`, `whmcs://clients/{id}/summary`, `whmcs://system/activity` (admin).
-4. **Success looks like:** Tool calls return JSON with expected shape (e.g. `clients`, `products`, `invoiceid`) and no stack traces. Resource URIs in responses do not include `?token=...`. In `read_only` mode, write tools (e.g. `mark_invoice_paid`) return a clear "not available in read_only mode" error.
+4. **Success looks like:** Tool calls return JSON with expected shape (e.g. `clients`, `products`, `invoiceid`) and no stack traces. Resources read without any `auth_token`/`token` and respect `MCP_ACCESS_MODE`. In `read_only` mode, write tools (e.g. `mark_invoice_paid`) return a clear "not available in read_only mode" error.
 
 See [cursor-mcp-config.json](cursor-mcp-config.json) for the reference MCP config and [docs/cursor-skills.md](docs/cursor-skills.md) for recommended Cursor skills.
 

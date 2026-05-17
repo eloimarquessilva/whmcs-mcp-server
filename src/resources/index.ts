@@ -10,7 +10,7 @@ import { McpServer, ResourceTemplate } from '@modelcontextprotocol/sdk/server/mc
 import { WhmcsClient, WhmcsBusinessError } from '../whmcs/WhmcsClient.js';
 import { Logger } from '../logging.js';
 import { RateLimiter } from '../rateLimiter.js';
-import { ensureResourceAuth, isClientMode, ensureClientAllowed, ensureClientOwnership, stripAuthFromUri } from '../security.js';
+import { isClientMode, ensureClientAllowed, ensureClientOwnership, stripAuthFromUri } from '../security.js';
 import { normalizeToArray } from '../whmcs/normalizers.js';
 
 /**
@@ -59,9 +59,6 @@ export function registerResources(
       const clientid = parsed.value;
 
       try {
-        const authResult = ensureResourceAuth(uri);
-        if (!authResult.ok) return authResult.response;
-
         if (isClientMode()) {
           const scopeError = ensureClientAllowed(clientid);
           if (scopeError) {
@@ -147,9 +144,6 @@ export function registerResources(
       const invoiceid = parsed.value;
 
       try {
-        const authResult = ensureResourceAuth(uri);
-        if (!authResult.ok) return authResult.response;
-
         resourceLogger.info('Fetching invoice history', { invoiceid });
 
         if (!rateLimiter.tryConsume()) {
@@ -253,9 +247,6 @@ export function registerResources(
       const ticketid = parsed.value;
 
       try {
-        const authResult = ensureResourceAuth(uri);
-        if (!authResult.ok) return authResult.response;
-
         resourceLogger.info('Fetching ticket thread', { ticketid });
 
         if (!rateLimiter.tryConsume()) {
@@ -371,9 +362,6 @@ export function registerResources(
       const clientid = parsed.value;
 
       try {
-        const authResult = ensureResourceAuth(uri);
-        if (!authResult.ok) return authResult.response;
-
         if (isClientMode()) {
           const scopeError = ensureClientAllowed(clientid);
           if (scopeError) {
@@ -509,9 +497,6 @@ export function registerResources(
       const safeUri = stripAuthFromUri(uri);
 
       try {
-        const authResult = ensureResourceAuth(uri);
-        if (!authResult.ok) return authResult.response;
-
         if (isClientMode()) {
           return {
             contents: [{

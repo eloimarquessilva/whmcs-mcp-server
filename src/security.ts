@@ -1,10 +1,14 @@
 /**
  * Security helpers for MCP access control
- * - Optional shared-secret auth for tools/resources
+ * - Optional shared-secret auth for TOOL CALLS (auth_token param). This server
+ *   is stdio-only; MCP resources are NOT authenticated via a URI-query token
+ *   (the SDK's $-anchored URI matching makes that unworkable, and on stdio the
+ *   spawning process is the trust boundary). Resources are gated by
+ *   MCP_ACCESS_MODE / client-scope only.
  * - Access mode (admin vs client) gating
  * - Client scope enforcement
  * - Constant-time token comparison (SEC-001)
- * - No auth params in response URIs (SEC-002, SEC-004)
+ * - No auth params in response URIs (SEC-002, SEC-004) — defensive hygiene
  */
 
 import crypto from 'node:crypto';
@@ -43,10 +47,6 @@ interface McpToolResponse {
   isError?: boolean;
 }
 
-interface ResourceResponse {
-  contents: { uri: string; mimeType: string; text: string }[];
-}
-
 export const AUTH_SHAPE = {
   auth_token: z.string().optional().describe('MCP auth token'),
 };
@@ -66,19 +66,6 @@ function toolError(message: string, extra?: Record<string, unknown>): McpToolRes
       }),
     }],
     isError: true,
-  };
-}
-
-function resourceError(uri: string, message: string, extra?: Record<string, unknown>): ResourceResponse {
-  return {
-    contents: [{
-      uri,
-      mimeType: 'application/json',
-      text: JSON.stringify({
-        error: message,
-        ...(extra ? extra : {}),
-      }),
-    }],
   };
 }
 
@@ -114,20 +101,6 @@ export function ensureToolAuth(params: Record<string, unknown>): McpToolResponse
 
   delete (params).auth_token;
   return null;
-}
-
-export function ensureResourceAuth(uri: URL): { ok: true } | { ok: false; response: ResourceResponse } {
-  const required = config.MCP_AUTH_TOKEN;
-  if (!required) {
-    return { ok: true };
-  }
-
-  const token = uri.searchParams.get('token') || uri.searchParams.get('auth_token');
-  if (!token || !safeCompareTokens(token, required)) {
-    return { ok: false, response: resourceError(stripAuthFromUri(uri), 'Unauthorized: missing or invalid token.') };
-  }
-
-  return { ok: true };
 }
 
 export function clientModeDenied(toolName: string): McpToolResponse {
