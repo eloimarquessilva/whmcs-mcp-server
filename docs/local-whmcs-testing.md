@@ -126,6 +126,24 @@ created `tblapi_credentials`). One-time, ~20 s, per leg:
 3. Copy the **Identifier + Secret** into `.env.local`
    (`WHMCS_IDENTIFIER` / `WHMCS_SECRET`).
 
+> **Where WHMCS stores it:** 8.13.3 / 9.0.4 keep API credentials in
+> **`tbldeviceauth`** (the older `tblapi_credentials` no longer exists).
+> The generated credential lands **only** in the leg whose admin you used.
+> To make the *same* Identifier/Secret work on the other leg too, mirror
+> the row (exact hashed `secret`/`compat_secret`/`role_ids`; bcrypt
+> `password_verify`):
+>
+> ```bash
+> # generated on the 9.0 admin (:8890) → also works on 8.13 (:8813)
+> npm run whmcs:test:replicate-cred <IDENTIFIER> mcpw9 mcpw8
+> ```
+>
+> Then `npm run whmcs:test:snapshot` so `reset` keeps the credential.
+> Verified e2e on both legs: GetClients/GetProducts/GetInvoices/
+> GetClientsDetails all `success` with scrubbed emails, and
+> **`DomainWhois` returns `{"result":"success",...}`** — i.e. the prod
+> "DomainWhois 500" was prod-server-specific, not an MCP/WHMCS bug.
+
 Then run the e2e matrix:
 
 ```bash
