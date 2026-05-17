@@ -67,6 +67,33 @@ fixup_one() {
   echo "    SystemURL + Domain → $public_url"
   echo "    DisableSessionIPCheck=on, NetworkIssuesRequireLogin='', CAPTCHA fully off (dev-only)"
 
+  # WHMCS External API IP allowlist (tblconfiguration.APIAllowedIPs) is a
+  # STRICT exact-match whitelist: empty = deny-all, and it does NOT honor
+  # 0.0.0.0/0, '*', or broad CIDRs (verified) — only the literal source IP
+  # works. The MCP reaches WHMCS from a docker bridge IP that varies and
+  # is often outside RFC1918. Self-heal: probe the API; ONLY if the gate
+  # is currently closed ("Invalid IP <addr>") whitelist exactly that addr
+  # (+127.0.0.1), PHP-serialized for correct length prefixes. If the gate
+  # is already open, leave APIAllowedIPs untouched. Dev-only; credentials
+  # are still required.
+  rej_ip="$(curl -sS --max-time 8 "http://localhost:$port/includes/api.php" \
+    --data-urlencode 'action=GetStats' --data-urlencode 'identifier=x' \
+    --data-urlencode 'secret=x' --data-urlencode 'responsetype=json' 2>/dev/null \
+    | grep -oE 'Invalid IP [0-9.]+' | awk '{print $3}' | head -1)"
+  if [ -n "$rej_ip" ]; then
+    api_ips="$(docker compose -f "$COMPOSE_FILE" exec -T "$leg-php" php -r \
+      'echo serialize([["ip"=>$argv[1],"note"=>"dev"],["ip"=>"127.0.0.1","note"=>"local"]]);' \
+      "$rej_ip" 2>/dev/null | tr -d '\r')"
+    if [ "${api_ips:0:2}" = "a:" ]; then
+      docker compose -f "$COMPOSE_FILE" exec -T "$mariadb" \
+        mariadb -uroot "-p$db_root_pw" "$db_name" \
+        -e "UPDATE tblconfiguration SET value='$(printf '%s' "$api_ips" | sed "s/'/''/g")' WHERE setting='APIAllowedIPs';" >/dev/null 2>&1 || true
+      echo "    APIAllowedIPs → whitelisted $rej_ip + 127.0.0.1 (dev-only)"
+    fi
+  else
+    echo "    APIAllowedIPs OK (API IP gate already open)"
+  fi
+
   docker compose -f "$COMPOSE_FILE" exec -T "$leg" sh -lc \
     'rm -rf /var/www/whmcs_storage/templates_c/* /var/www/whmcs_storage/sessions/* 2>/dev/null || true' \
     >/dev/null 2>&1 || true

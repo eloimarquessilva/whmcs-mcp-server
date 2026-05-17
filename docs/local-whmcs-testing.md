@@ -102,19 +102,46 @@ npm run whmcs:test:snapshot  # capture the seeded + upgraded state
 (WHMCS' install-folder boot guard) — that is the single source of truth for
 "the stack is healthy and snapshottable".
 
-## WHMCS API credentials
+## WHMCS API credentials (the one manual step)
 
-With **Path 1** (`seed-prod`), prod's existing API credentials are carried
-over but their secrets are blanked and `tblapi_credentials.ip_restriction` is
-cleared. Generate (or regenerate) a credential in each local WHMCS admin and
-copy it into `.env.local`:
+Everything else is automated and verified working: latest WHMCS on both
+legs, scrubbed prod data, captcha off, admin login, **and the WHMCS
+External-API IP allowlist** (`post-install-fixup` self-heals
+`tblconfiguration.APIAllowedIPs` — it's a strict exact-match whitelist;
+empty = deny-all, and `0.0.0.0/0`/`*`/broad-CIDR are NOT honored, so the
+fixup probes the API and whitelists the exact docker source IP WHMCS
+reports). Connectivity is proven: a dummy call returns
+`{"result":"error","message":"Invalid or missing credentials"}` — i.e.
+the only thing left is a real credential.
 
-In each local WHMCS admin (`/admin/`, log in as `admin` / `DevOnly#2026!secure`):
+WHMCS 8.13.3 / 9.0.4 generate API credentials **only via the admin SPA**
+(no reliable headless contract — ioncube backend + React UI + lazily
+created `tblapi_credentials`). One-time, ~20 s, per leg:
 
-1. **System Settings → API Credentials → Generate New API Credential**
-2. Role: a full-admin API role for dev (or scope per test).
-3. Leave **API IP Access Restriction blank** (the MCP connects from the host).
-4. Copy the Identifier + Secret into `.env.local` (see below).
+1. Log in to `http://localhost:8813/admin/` (and `:8890`) as
+   **`admin` / `DevOnly#2026!secure`** (captcha is off).
+2. **Configuration (⚙)→ System Settings → API Credentials → Generate
+   New API Credential.** Role: **Admin** (full; from the seeded
+   `tblapi_roles`). Leave IP restriction blank.
+3. Copy the **Identifier + Secret** into `.env.local`
+   (`WHMCS_IDENTIFIER` / `WHMCS_SECRET`).
+
+Then run the e2e matrix:
+
+```bash
+MCP_ENV=local npm run build
+MCP_ENV=local npm test                 # integration tests now hit local WHMCS
+# read-only + write tools, both legs (WHMCS_API_URL=:8813 then :8890)
+```
+
+Verify the credential works before wiring the MCP:
+
+```bash
+curl -s http://localhost:8813/includes/api.php \
+  --data-urlencode action=GetStats \
+  --data-urlencode identifier=<ID> --data-urlencode secret=<SECRET> \
+  --data-urlencode responsetype=json      # expect {"result":"success",...}
+```
 
 ## Point the MCP at it (env separation)
 
