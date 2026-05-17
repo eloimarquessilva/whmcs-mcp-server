@@ -53,15 +53,20 @@ UPDATE tblservers
 
 -- ---- Reset to a single known DEV admin (creds documented in runbook) ----
 -- Keep the lowest-id admin, scrub PII + 2FA, set a known bcrypt password.
+-- WHMCS 8.x/9.x verifies the admin login against `passwordhash` (the
+-- `password` column alone is NOT sufficient — both must be set). And
+-- password_reset_data/expiry are NOT NULL columns: assigning NULL aborts
+-- the whole UPDATE (and under `mysql --force` it is silently SKIPPED, so
+-- the admin keeps prod creds). Set both hash columns; only clear the
+-- reset *key* (leave the NOT NULL reset_data/expiry untouched).
 UPDATE tbladmins
-  SET username   = 'admin',
-      email      = 'devadmin@example.test',
-      password   = '__ADMIN_PWHASH__',
-      authmodule = '',
-      authdata   = '',
-      password_reset_key  = '',
-      password_reset_data = NULL,
-      password_reset_expiry = NULL,
+  SET username     = 'admin',
+      email        = 'devadmin@example.test',
+      password     = '__ADMIN_PWHASH__',
+      passwordhash = '__ADMIN_PWHASH__',
+      authmodule   = '',
+      authdata     = '',
+      password_reset_key = '',
       loginattempts = 0,
       disabled   = 0
   WHERE id = (SELECT mid FROM (SELECT MIN(id) AS mid FROM tbladmins) z);
