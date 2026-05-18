@@ -358,8 +358,8 @@ export function registerResources(
             amount: string;
           }[] };
           totalresults?: number;
-        }>('GetOrders', { userid: clientid, limitnum: 10 });
-        
+        }>('GetOrders', { userid: clientid, limitnum: 25 });
+
         // Fetch recent invoices
         const invoices = await whmcsClient.read<{
           invoices?: { invoice?: {
@@ -370,8 +370,8 @@ export function registerResources(
             total: string;
           }[] };
           totalresults?: number;
-        }>('GetInvoices', { userid: clientid, limitnum: 10 });
-        
+        }>('GetInvoices', { userid: clientid, limitnum: 10, orderby: 'date', order: 'desc' });
+
         // Fetch recent tickets
         const tickets = await whmcsClient.read<{
           tickets?: { ticket?: {
@@ -381,7 +381,7 @@ export function registerResources(
             status: string;
           }[] };
           totalresults?: number;
-        }>('GetTickets', { clientid, limitnum: 10, status: '' });
+        }>('GetTickets', { clientid, limitnum: 25, status: '' });
         
         // Define interfaces for type safety
         interface OrderSummary {
@@ -406,10 +406,17 @@ export function registerResources(
           status: string;
         }
         
-        const recentOrders = normalizeToArray<OrderSummary>(orders.orders?.order);
+        // GetOrders/GetTickets do not reliably honor server-side ordering;
+        // sort client-side by date DESC (newest-first) then keep a compact
+        // top-10 timeline. GetInvoices is already server-ordered+limited.
+        const recentOrders = [...normalizeToArray<OrderSummary>(orders.orders?.order)]
+          .sort((a, b) => String(b.date).localeCompare(String(a.date)))
+          .slice(0, 10);
         const recentInvoices = normalizeToArray<InvoiceSummary>(invoices.invoices?.invoice);
-        const recentTickets = normalizeToArray<TicketSummary>(tickets.tickets?.ticket);
-        
+        const recentTickets = [...normalizeToArray<TicketSummary>(tickets.tickets?.ticket)]
+          .sort((a, b) => String(b.date).localeCompare(String(a.date)))
+          .slice(0, 10);
+
         return {
           contents: [{
             uri: safeUri,
@@ -429,12 +436,13 @@ export function registerResources(
                 status: i.status,
                 total: i.total,
               })),
-              recent_tickets: recentTickets.map((t) => ({
+              tickets_best_effort: recentTickets.map((t) => ({
                 id: t.id,
                 date: t.date,
                 subject: t.subject,
                 status: t.status,
               })),
+              tickets_note: 'best-effort; not guaranteed full support history (GetTickets clientid filter may miss operator/admin-created tickets)',
             }, null, 2),
           }],
         };
