@@ -39,7 +39,7 @@ For deeper diagrams — write-flow lifecycle, workflow-tool orchestration, and g
 - **~70 MCP tools** across several layers (see [Tool Catalog](#tool-catalog)):
   - **Client & billing** — create/search/update clients, invoices, refunds, credits, orders, products
   - **Domains & support** — registration, renewals, transfers, tickets, departments
-  - **Governed lists & reporting** — per-client paginated lists, global invoice/service reporting, activity log
+  - **Governed lists & reporting** — per-client paginated lists, global invoice/service reporting, multi-filter `search_services`, activity log
   - **Aggregators** — `get_account_360`, `get_billing_snapshot`, `get_renewal_snapshot`, `get_reconciliation_snapshot`, and ten more composite read snapshots
   - **Capability & probes** — `get_capability_matrix`, `get_stats`, transactions, automation log, system refs
   - **Controlled write-flow** — `draft_write_intent` → `validate_write_intent` → `approve_write_intent` → `execute_write_intent` → `get_write_intent`, plus a one-call `write` shortcut. **Sealed by default** — `MCP_MODE=read_only` plus empty `MCP_PROD_WRITE_AUTHORIZED` makes production writes byte-identical to absolute deny.
@@ -345,6 +345,7 @@ cp .env.example .env
 - `get_activity_log` — Activity log with canonical mapping when governance is enabled
 - `list_invoices` — Global invoice list for revenue/paying-client reporting
 - `list_services` — Global service list
+- `search_services` — Multi-filter service/product discovery: array filters (`serviceids`, `product_ids`, `clientids`, `domains`, `usernames`), local `statuses`/`domain_contains` filters, and paginated `services`/`clients`/`products` views
 
 ### Capability & Probes
 
