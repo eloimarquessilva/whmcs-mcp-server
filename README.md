@@ -4,11 +4,11 @@ A production-ready **Model Context Protocol (MCP)** server that enables AI agent
 
 ## Features
 
-- **24 MCP Tools** for comprehensive WHMCS management:
+- **26 MCP Tools** for comprehensive WHMCS management:
   - Client management (create, search, get details, update)
   - Billing operations (invoices, payments, refunds, credits)
   - Order processing (products, accept orders)
-  - Service lifecycle (suspend, unsuspend, terminate, details)
+  - Services & products (search, details, suspend, unsuspend, terminate)
   - Domain management (availability, register, renew, transfer, sync)
   - Support ticketing (create, reply, departments)
 
@@ -132,7 +132,14 @@ Add to your Cursor MCP settings (`~/.cursor/mcp.json`):
 - `search_clients` - Search clients by name/email/company
 - `get_client_details` - Get full client details for one or more clients
 - `update_client` - Update client details
+
+### Services & Products
+
+- `search_services` - Search contracted services/products via GetClientsProducts with array filters and paginated `services`, `clients`, or `products` views
 - `get_service_details` - Get detailed service information
+- `suspend_service` - Suspend an active service
+- `unsuspend_service` - Unsuspend a service
+- `terminate_service` - Permanently terminate (requires confirm=true)
 
 ### Billing & Financial
 
@@ -148,12 +155,6 @@ Add to your Cursor MCP settings (`~/.cursor/mcp.json`):
 
 - `list_products` - List available products
 - `accept_order` - Accept a pending order
-
-### Service Lifecycle
-
-- `suspend_service` - Suspend an active service
-- `unsuspend_service` - Unsuspend a service
-- `terminate_service` - Permanently terminate (requires confirm=true)
 
 ### Domains
 
@@ -198,6 +199,7 @@ This server always uses WHMCS **admin** API credentials under the hood. `MCP_ACC
 - `list_products`
 - `get_invoice` (scoped to allowed client IDs)
 - `get_client_details` (scoped)
+- `search_services` (scoped)
 - `get_service_details` (scoped)
 - `create_ticket` (scoped)
 - `reply_ticket` (client replies only, scoped)

@@ -1,7 +1,7 @@
 /**
  * Service Lifecycle Tools for WHMCS MCP Server
  * 
- * Tools: suspend_service, unsuspend_service, terminate_service
+ * Tools: search_services, suspend_service, unsuspend_service, terminate_service
  */
 
 import { z } from 'zod';
@@ -9,10 +9,864 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { WhmcsClient, WhmcsBusinessError } from '../whmcs/WhmcsClient.js';
 import { Logger } from '../logging.js';
 import { RateLimiter, RateLimitError } from '../rateLimiter.js';
-import { isToolAllowed } from '../config.js';
+import { config, isToolAllowed } from '../config.js';
 import { ensureToolAuth, clientModeDenied, isClientMode, AUTH_SHAPE } from '../security.js';
+import { normalizeToArray } from '../whmcs/normalizers.js';
 
 const TOOL_VERSION = 'v1';
+
+const serviceStatusSchema = z.enum([
+  'Pending',
+  'Active',
+  'Suspended',
+  'Terminated',
+  'Cancelled',
+  'Fraud',
+]);
+
+export const searchServicesSchema = z.object({
+  serviceids: z.array(z.number().int().positive())
+    .min(1)
+    .max(config.MCP_MAX_PAGE_SIZE)
+    .optional()
+    .describe('One or more WHMCS service IDs. Maps to GetClientsProducts serviceid.'),
+
+  product_ids: z.array(z.number().int().positive())
+    .min(1)
+    .max(config.MCP_MAX_PAGE_SIZE)
+    .optional()
+    .describe('One or more WHMCS product IDs. Maps to GetClientsProducts pid.'),
+
+  clientids: z.array(z.number().int().positive())
+    .min(1)
+    .max(config.MCP_MAX_PAGE_SIZE)
+    .optional()
+    .describe('One or more WHMCS client IDs. Maps to GetClientsProducts clientid.'),
+
+  domains: z.array(z.string().min(1))
+    .min(1)
+    .max(config.MCP_MAX_PAGE_SIZE)
+    .optional()
+    .describe('Exact domain filters. Maps to GetClientsProducts domain.'),
+
+  usernames: z.array(z.string().min(1))
+    .min(1)
+    .max(config.MCP_MAX_PAGE_SIZE)
+    .optional()
+    .describe('Exact username filters. Maps to GetClientsProducts username2.'),
+
+  statuses: z.array(serviceStatusSchema)
+    .min(1)
+    .optional()
+    .describe('Service statuses. Not a native WHMCS filter; applied locally after fetching.'),
+
+  domain_contains: z.string()
+    .min(1)
+    .optional()
+    .describe('Case-insensitive local contains filter for service domain.'),
+
+  view: z.enum(['services', 'clients', 'products'])
+    .default('services')
+    .describe("Response shape and pagination unit: 'services' pages service rows, 'clients' pages client groups, 'products' pages product groups."),
+
+  include_client_details: z.boolean()
+    .default(false)
+    .describe('When true, adds basic client identity fields to returned service/client groups for the current page.'),
+
+  include_server: z.boolean().default(true),
+  include_usage: z.boolean().default(false),
+  include_custom_fields: z.boolean().default(false),
+  include_config_options: z.boolean().default(false),
+
+  page_size: z.number().int().min(1)
+    .max(config.MCP_MAX_PAGE_SIZE)
+    .default(Math.min(100, config.MCP_MAX_PAGE_SIZE))
+    .describe('Number of result items returned in this MCP response. The item type depends on view. Cannot exceed MCP_MAX_PAGE_SIZE.'),
+
+  offset: z.number().int().min(0)
+    .default(0)
+    .describe('Offset into the final aggregated result. For next pages, reuse the same filters with offset=next_offset from the previous response.'),
+
+  sort_by: z.enum([
+    'serviceid',
+    'clientid',
+    'product_id',
+    'next_due_date',
+    'status',
+  ]).default('serviceid'),
+
+  sort_order: z.enum(['asc', 'desc']).default('asc'),
+
+  allow_broad_search: z.boolean()
+    .default(false)
+    .describe('Required when no primary filters are provided. Prevents accidental full scans.'),
+});
+
+type SearchServicesParams = z.infer<typeof searchServicesSchema>;
+type SortBy = SearchServicesParams['sort_by'];
+type SortOrder = SearchServicesParams['sort_order'];
+
+interface WhmcsServiceRecord {
+  id?: unknown;
+  qty?: unknown;
+  clientid?: unknown;
+  orderid?: unknown;
+  ordernumber?: unknown;
+  pid?: unknown;
+  regdate?: unknown;
+  name?: unknown;
+  translated_name?: unknown;
+  groupname?: unknown;
+  translated_groupname?: unknown;
+  domain?: unknown;
+  dedicatedip?: unknown;
+  serverid?: unknown;
+  servername?: unknown;
+  serverip?: unknown;
+  serverhostname?: unknown;
+  suspensionreason?: unknown;
+  firstpaymentamount?: unknown;
+  recurringamount?: unknown;
+  paymentmethod?: unknown;
+  paymentmethodname?: unknown;
+  billingcycle?: unknown;
+  nextduedate?: unknown;
+  status?: unknown;
+  username?: unknown;
+  password?: unknown;
+  subscriptionid?: unknown;
+  promoid?: unknown;
+  overideautosuspend?: unknown;
+  overidesuspenduntil?: unknown;
+  ns1?: unknown;
+  ns2?: unknown;
+  assignedips?: unknown;
+  notes?: unknown;
+  diskusage?: unknown;
+  disklimit?: unknown;
+  bwusage?: unknown;
+  bwlimit?: unknown;
+  lastupdate?: unknown;
+  customfields?: unknown;
+  configoptions?: unknown;
+}
+
+interface WhmcsGetClientsProductsResponse {
+  products?: {
+    product?: unknown;
+  };
+  totalresults?: unknown;
+  numreturned?: unknown;
+  startnumber?: unknown;
+}
+
+interface WhmcsClientDetailsResponse {
+  id?: unknown;
+  firstname?: unknown;
+  lastname?: unknown;
+  fullname?: unknown;
+  email?: unknown;
+  companyname?: unknown;
+  status?: unknown;
+}
+
+interface BasicClientDetails {
+  clientid: number;
+  firstname: string;
+  lastname: string;
+  fullname: string;
+  email: string;
+  companyname: string | null;
+  status: string;
+}
+
+export interface NormalizedService {
+  serviceid: number;
+  qty: number | null;
+  clientid: number;
+  orderid: number | null;
+  ordernumber: string | null;
+  product_id: number | null;
+  registration_date: string | null;
+  product_name: string | null;
+  translated_product_name: string | null;
+  group_name: string | null;
+  translated_group_name: string | null;
+  domain: string | null;
+  status: string | null;
+  suspension_reason: string | null;
+  first_payment_amount: string | null;
+  recurring_amount: string | null;
+  payment_method: string | null;
+  payment_method_name: string | null;
+  billing_cycle: string | null;
+  next_due_date: string | null;
+  server?: {
+    id: number | null;
+    name: string | null;
+    ip: string | null;
+    hostname: string | null;
+  };
+  nameservers?: {
+    ns1: string | null;
+    ns2: string | null;
+  };
+  usage?: {
+    disk_usage: string | null;
+    disk_limit: string | null;
+    bandwidth_usage: string | null;
+    bandwidth_limit: string | null;
+    last_update: string | null;
+  };
+  custom_fields?: {
+    id?: number;
+    name?: string;
+    value?: string;
+  }[];
+  config_options?: {
+    id?: number;
+    option?: string;
+    type?: string;
+    value?: string;
+  }[];
+  client?: BasicClientDetails;
+}
+
+interface ClientGroup {
+  clientid: number;
+  service_count: number;
+  product_count: number;
+  product_ids: number[];
+  serviceids: number[];
+  services: NormalizedService[];
+  client?: BasicClientDetails;
+}
+
+interface ProductGroup {
+  product_id: number | null;
+  product_name: string | null;
+  translated_product_name: string | null;
+  group_name: string | null;
+  translated_group_name: string | null;
+  service_count: number;
+  client_count: number;
+  clientids: number[];
+  serviceids: number[];
+  services: NormalizedService[];
+}
+
+interface ToolResponse {
+  [key: string]: unknown;
+  content: { type: 'text'; text: string }[];
+  isError?: boolean;
+}
+
+function toolError(message: string, extra?: Record<string, unknown>): ToolResponse {
+  return {
+    content: [{
+      type: 'text' as const,
+      text: JSON.stringify({
+        isError: true,
+        error: message,
+        ...(extra ?? {}),
+      }),
+    }],
+    isError: true,
+  };
+}
+
+function uniqueValues<T extends string | number>(values?: T[]): T[] | undefined {
+  if (!values || values.length === 0) {
+    return undefined;
+  }
+
+  const seen = new Set<string>();
+  const unique: T[] = [];
+
+  for (const value of values) {
+    const key = typeof value === 'string' ? value : String(value);
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    unique.push(value);
+  }
+
+  return unique;
+}
+
+function toNullableString(value: unknown): string | null {
+  if (value === null || value === undefined) {
+    return null;
+  }
+
+  if (typeof value !== 'string' && typeof value !== 'number' && typeof value !== 'boolean' && typeof value !== 'bigint') {
+    return null;
+  }
+
+  const normalized = `${value}`.trim();
+  return normalized.length === 0 ? null : normalized;
+}
+
+function toNullableNumber(value: unknown): number | null {
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value;
+  }
+
+  if (typeof value === 'string') {
+    const normalized = value.trim();
+    if (normalized.length === 0) {
+      return null;
+    }
+
+    const parsed = Number.parseInt(normalized, 10);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+
+  return null;
+}
+
+function toNullableDate(value: unknown): string | null {
+  const normalized = toNullableString(value);
+  if (!normalized) {
+    return null;
+  }
+
+  if (normalized === '0000-00-00' || normalized === '0000-00-00 00:00:00') {
+    return null;
+  }
+
+  return normalized;
+}
+
+function toComparableString(value: unknown): string | null {
+  const normalized = toNullableString(value);
+  return normalized ? normalized.toLowerCase() : null;
+}
+
+function hasPrimaryFilter(params: SearchServicesParams): boolean {
+  return [
+    params.serviceids?.length ?? 0,
+    params.product_ids?.length ?? 0,
+    params.clientids?.length ?? 0,
+    params.domains?.length ?? 0,
+    params.usernames?.length ?? 0,
+    params.statuses?.length ?? 0,
+    params.domain_contains?.length ?? 0,
+  ].some((value) => value > 0);
+}
+
+function resolveScopedClientIds(params: SearchServicesParams): { clientids?: number[]; error?: ReturnType<typeof toolError> } {
+  const requestedClientIds = uniqueValues(params.clientids);
+
+  if (!isClientMode()) {
+    return { clientids: requestedClientIds };
+  }
+
+  const allowedClientIds = uniqueValues(config.MCP_ALLOWED_CLIENT_IDS) ?? [];
+  if (allowedClientIds.length === 0) {
+    return {
+      error: toolError('Client access mode requires MCP_ALLOWED_CLIENT_IDS to be configured.'),
+    };
+  }
+
+  if (!requestedClientIds) {
+    return { clientids: allowedClientIds };
+  }
+
+  const disallowed = requestedClientIds.filter((clientId) => !allowedClientIds.includes(clientId));
+  if (disallowed.length > 0) {
+    return {
+      error: toolError('Access denied: client scope mismatch.', {
+        clientids: disallowed,
+      }),
+    };
+  }
+
+  return { clientids: requestedClientIds };
+}
+
+function buildNativeQueries(
+  params: SearchServicesParams,
+  scopedClientIds?: number[]
+): Record<string, unknown>[] {
+  const nativeFilters: [string, (string | number)[]][] = [];
+
+  const serviceIds = uniqueValues(params.serviceids);
+  const productIds = uniqueValues(params.product_ids);
+  const domainFilters = uniqueValues(params.domains);
+  const usernameFilters = uniqueValues(params.usernames);
+
+  if (serviceIds) {
+    nativeFilters.push(['serviceid', serviceIds]);
+  }
+
+  if (productIds) {
+    nativeFilters.push(['pid', productIds]);
+  }
+
+  if (scopedClientIds) {
+    nativeFilters.push(['clientid', scopedClientIds]);
+  }
+
+  if (domainFilters) {
+    nativeFilters.push(['domain', domainFilters]);
+  }
+
+  if (usernameFilters) {
+    nativeFilters.push(['username2', usernameFilters]);
+  }
+
+  if (nativeFilters.length === 0) {
+    return [{}];
+  }
+
+  let combinations: Record<string, unknown>[] = [{}];
+
+  for (const [key, values] of nativeFilters) {
+    const next: Record<string, unknown>[] = [];
+
+    for (const combination of combinations) {
+      for (const value of values) {
+        next.push({
+          ...combination,
+          [key]: value,
+        });
+      }
+    }
+
+    combinations = next;
+  }
+
+  const seen = new Set<string>();
+  return combinations.filter((combination) => {
+    const key = JSON.stringify(Object.entries(combination).sort(([left], [right]) => left.localeCompare(right)));
+    if (seen.has(key)) {
+      return false;
+    }
+    seen.add(key);
+    return true;
+  });
+}
+
+async function fetchProductsForQuery(
+  whmcsClient: WhmcsClient,
+  query: Record<string, unknown>
+): Promise<WhmcsServiceRecord[]> {
+  const records: WhmcsServiceRecord[] = [];
+  const limitnum = config.MCP_MAX_PAGE_SIZE;
+  let limitstart = 0;
+
+  for (;;) {
+    const response = await whmcsClient.read<WhmcsGetClientsProductsResponse>('GetClientsProducts', {
+      ...query,
+      limitstart,
+      limitnum,
+    });
+
+    const pageRecords = normalizeToArray<WhmcsServiceRecord>(response.products?.product);
+    records.push(...pageRecords);
+
+    const numreturned = toNullableNumber(response.numreturned) ?? pageRecords.length;
+    const totalresults = toNullableNumber(response.totalresults);
+    const startnumber = toNullableNumber(response.startnumber);
+
+    if (pageRecords.length === 0 || numreturned < limitnum) {
+      break;
+    }
+
+    if (startnumber !== null && totalresults !== null && startnumber + numreturned >= totalresults) {
+      break;
+    }
+
+    limitstart += limitnum;
+  }
+
+  return records;
+}
+
+function normalizeCustomFields(value: unknown): { id?: number; name?: string; value?: string }[] {
+  const container = (value as { customfield?: unknown } | undefined)?.customfield ?? value;
+
+  return normalizeToArray<Record<string, unknown>>(container)
+    .map((field) => {
+      const normalizedField: { id?: number; name?: string; value?: string } = {};
+
+      const id = toNullableNumber(field.id);
+      const name = toNullableString(field.name);
+      const fieldValue = toNullableString(field.value);
+
+      if (id !== null) {
+        normalizedField.id = id;
+      }
+
+      if (name !== null) {
+        normalizedField.name = name;
+      }
+
+      if (fieldValue !== null) {
+        normalizedField.value = fieldValue;
+      }
+
+      return normalizedField;
+    })
+    .filter((field) => Object.keys(field).length > 0);
+}
+
+function normalizeConfigOptions(value: unknown): { id?: number; option?: string; type?: string; value?: string }[] {
+  const container = (value as { configoption?: unknown } | undefined)?.configoption ?? value;
+
+  return normalizeToArray<Record<string, unknown>>(container)
+    .map((option) => {
+      const normalizedOption: { id?: number; option?: string; type?: string; value?: string } = {};
+
+      const id = toNullableNumber(option.id);
+      const name = toNullableString(option.option);
+      const type = toNullableString(option.type);
+      const optionValue = toNullableString(option.value);
+
+      if (id !== null) {
+        normalizedOption.id = id;
+      }
+
+      if (name !== null) {
+        normalizedOption.option = name;
+      }
+
+      if (type !== null) {
+        normalizedOption.type = type;
+      }
+
+      if (optionValue !== null) {
+        normalizedOption.value = optionValue;
+      }
+
+      return normalizedOption;
+    })
+    .filter((option) => Object.keys(option).length > 0);
+}
+
+function matchesFilters(
+  record: WhmcsServiceRecord,
+  params: SearchServicesParams,
+  scopedClientIds?: number[]
+): boolean {
+  const serviceIds = uniqueValues(params.serviceids);
+  const productIds = uniqueValues(params.product_ids);
+  const domains = uniqueValues(params.domains)?.map((domain) => domain.toLowerCase());
+  const usernames = uniqueValues(params.usernames);
+  const statuses = params.statuses ? new Set<string>(params.statuses) : undefined;
+  const serviceId = toNullableNumber(record.id);
+  const clientId = toNullableNumber(record.clientid);
+  const productId = toNullableNumber(record.pid);
+  const domain = toComparableString(record.domain);
+  const username = toNullableString(record.username);
+  const status = toNullableString(record.status);
+  const domainContains = params.domain_contains?.trim().toLowerCase();
+
+  if (serviceIds && (serviceId === null || !serviceIds.includes(serviceId))) {
+    return false;
+  }
+
+  if (productIds && (productId === null || !productIds.includes(productId))) {
+    return false;
+  }
+
+  if (scopedClientIds && (clientId === null || !scopedClientIds.includes(clientId))) {
+    return false;
+  }
+
+  if (domains && (domain === null || !domains.includes(domain))) {
+    return false;
+  }
+
+  if (usernames && (username === null || !usernames.includes(username))) {
+    return false;
+  }
+
+  if (statuses && (status === null || !statuses.has(status))) {
+    return false;
+  }
+
+  if (domainContains && !domain?.includes(domainContains)) {
+    return false;
+  }
+
+  return true;
+}
+
+function normalizeService(
+  record: WhmcsServiceRecord,
+  params: SearchServicesParams
+): NormalizedService | null {
+  const serviceid = toNullableNumber(record.id);
+  const clientid = toNullableNumber(record.clientid);
+
+  if (serviceid === null || clientid === null) {
+    return null;
+  }
+
+  const normalized: NormalizedService = {
+    serviceid,
+    qty: toNullableNumber(record.qty),
+    clientid,
+    orderid: toNullableNumber(record.orderid),
+    ordernumber: toNullableString(record.ordernumber),
+    product_id: toNullableNumber(record.pid),
+    registration_date: toNullableDate(record.regdate),
+    product_name: toNullableString(record.name),
+    translated_product_name: toNullableString(record.translated_name),
+    group_name: toNullableString(record.groupname),
+    translated_group_name: toNullableString(record.translated_groupname),
+    domain: toNullableString(record.domain),
+    status: toNullableString(record.status),
+    suspension_reason: toNullableString(record.suspensionreason),
+    first_payment_amount: toNullableString(record.firstpaymentamount),
+    recurring_amount: toNullableString(record.recurringamount),
+    payment_method: toNullableString(record.paymentmethod),
+    payment_method_name: toNullableString(record.paymentmethodname),
+    billing_cycle: toNullableString(record.billingcycle),
+    next_due_date: toNullableDate(record.nextduedate),
+  };
+
+  if (params.include_server) {
+    normalized.server = {
+      id: toNullableNumber(record.serverid),
+      name: toNullableString(record.servername),
+      ip: toNullableString(record.serverip),
+      hostname: toNullableString(record.serverhostname),
+    };
+  }
+
+  const ns1 = toNullableString(record.ns1);
+  const ns2 = toNullableString(record.ns2);
+  if (ns1 !== null || ns2 !== null) {
+    normalized.nameservers = { ns1, ns2 };
+  }
+
+  if (params.include_usage) {
+    normalized.usage = {
+      disk_usage: toNullableString(record.diskusage),
+      disk_limit: toNullableString(record.disklimit),
+      bandwidth_usage: toNullableString(record.bwusage),
+      bandwidth_limit: toNullableString(record.bwlimit),
+      last_update: toNullableDate(record.lastupdate),
+    };
+  }
+
+  if (params.include_custom_fields) {
+    normalized.custom_fields = normalizeCustomFields(record.customfields);
+  }
+
+  if (params.include_config_options) {
+    normalized.config_options = normalizeConfigOptions(record.configoptions);
+  }
+
+  return normalized;
+}
+
+function compareNullableValues<T>(
+  left: T | null,
+  right: T | null,
+  compare: (leftValue: T, rightValue: T) => number,
+  order: SortOrder
+): number {
+  if (left === null && right === null) {
+    return 0;
+  }
+
+  if (left === null) {
+    return 1;
+  }
+
+  if (right === null) {
+    return -1;
+  }
+
+  const result = compare(left, right);
+  return order === 'asc' ? result : -result;
+}
+
+function compareNumbers(left: number, right: number): number {
+  return left - right;
+}
+
+function compareStrings(left: string, right: string): number {
+  return left.localeCompare(right);
+}
+
+function compareServices(
+  left: NormalizedService,
+  right: NormalizedService,
+  sortBy: SortBy,
+  sortOrder: SortOrder
+): number {
+  const compareByField = (() => {
+    switch (sortBy) {
+      case 'clientid':
+        return compareNullableValues(left.clientid, right.clientid, compareNumbers, sortOrder);
+      case 'product_id':
+        return compareNullableValues(left.product_id, right.product_id, compareNumbers, sortOrder);
+      case 'next_due_date':
+        return compareNullableValues(left.next_due_date, right.next_due_date, compareStrings, sortOrder);
+      case 'status':
+        return compareNullableValues(left.status, right.status, compareStrings, sortOrder);
+      case 'serviceid':
+      default:
+        return compareNullableValues(left.serviceid, right.serviceid, compareNumbers, sortOrder);
+    }
+  })();
+
+  if (compareByField !== 0) {
+    return compareByField;
+  }
+
+  if (left.serviceid !== right.serviceid) {
+    return left.serviceid - right.serviceid;
+  }
+
+  return left.clientid - right.clientid;
+}
+
+async function fetchClientDetails(
+  whmcsClient: WhmcsClient,
+  clientIds: number[]
+): Promise<{ details: Map<number, BasicClientDetails>; warnings: string[] }> {
+  const details = new Map<number, BasicClientDetails>();
+  const warnings: string[] = [];
+
+  for (const clientId of uniqueValues(clientIds) ?? []) {
+    try {
+      const response = await whmcsClient.read<WhmcsClientDetailsResponse>('GetClientsDetails', {
+        clientid: clientId,
+      });
+
+      const firstname = toNullableString(response.firstname) ?? '';
+      const lastname = toNullableString(response.lastname) ?? '';
+      const fallbackFullname = `${firstname} ${lastname}`.trim() || firstname || lastname;
+      const fullname = toNullableString(response.fullname) ?? fallbackFullname;
+      const email = toNullableString(response.email) ?? '';
+      const status = toNullableString(response.status) ?? 'Unknown';
+
+      details.set(clientId, {
+        clientid: clientId,
+        firstname,
+        lastname,
+        fullname,
+        email,
+        companyname: toNullableString(response.companyname),
+        status,
+      });
+    } catch (error) {
+      if (error instanceof WhmcsBusinessError) {
+        warnings.push(`Client details could not be enriched for clientid ${clientId}.`);
+        continue;
+      }
+
+      throw error;
+    }
+  }
+
+  return { details, warnings };
+}
+
+function attachClientDetails(
+  services: NormalizedService[],
+  clientDetails: Map<number, BasicClientDetails>
+): NormalizedService[] {
+  return services.map((service) => {
+    const client = clientDetails.get(service.clientid);
+    return client
+      ? { ...service, client }
+      : service;
+  });
+}
+
+function buildClientGroups(services: NormalizedService[]): ClientGroup[] {
+  const groups = new Map<number, ClientGroup>();
+
+  for (const service of services) {
+    let group = groups.get(service.clientid);
+
+    if (!group) {
+      group = {
+        clientid: service.clientid,
+        service_count: 0,
+        product_count: 0,
+        product_ids: [],
+        serviceids: [],
+        services: [],
+      };
+      groups.set(service.clientid, group);
+    }
+
+    group.service_count += 1;
+    group.serviceids.push(service.serviceid);
+    group.services.push(service);
+
+    if (service.product_id !== null && !group.product_ids.includes(service.product_id)) {
+      group.product_ids.push(service.product_id);
+      group.product_count += 1;
+    }
+  }
+
+  return Array.from(groups.values());
+}
+
+function buildProductGroups(services: NormalizedService[]): ProductGroup[] {
+  const groups = new Map<string, ProductGroup>();
+
+  for (const service of services) {
+    const key = service.product_id === null ? '__null__' : String(service.product_id);
+    let group = groups.get(key);
+
+    if (!group) {
+      group = {
+        product_id: service.product_id,
+        product_name: service.product_name,
+        translated_product_name: service.translated_product_name,
+        group_name: service.group_name,
+        translated_group_name: service.translated_group_name,
+        service_count: 0,
+        client_count: 0,
+        clientids: [],
+        serviceids: [],
+        services: [],
+      };
+      groups.set(key, group);
+    }
+
+    group.service_count += 1;
+    group.serviceids.push(service.serviceid);
+    group.services.push(service);
+
+    if (!group.clientids.includes(service.clientid)) {
+      group.clientids.push(service.clientid);
+      group.client_count += 1;
+    }
+  }
+
+  return Array.from(groups.values());
+}
+
+function buildFiltersApplied(
+  params: SearchServicesParams,
+  scopedClientIds?: number[]
+): Record<string, unknown> {
+  const filtersApplied: Record<string, unknown> = { ...params };
+
+  if (isClientMode() && !params.clientids && scopedClientIds) {
+    filtersApplied.clientids = scopedClientIds;
+    filtersApplied.client_scope_enforced = true;
+  }
+
+  return filtersApplied;
+}
+
+function finalizeWarnings(warnings: string[]): string[] | undefined {
+  const uniqueWarnings = uniqueValues(warnings);
+  return uniqueWarnings && uniqueWarnings.length > 0 ? uniqueWarnings : undefined;
+}
 
 /**
  * Suspend service input schema
@@ -49,6 +903,226 @@ export function registerServiceTools(
   logger: Logger,
   rateLimiter: RateLimiter
 ): void {
+
+  // ============================================
+  // Tool: search_services
+  // ============================================
+  if (isToolAllowed('search_services')) {
+    server.tool(
+      'search_services',
+      `Search WHMCS client services/products using GetClientsProducts. Use this tool to discover services by product, client, service ID, domain, username, or status. Pass arrays such as product_ids, clientids, or serviceids to search multiple values in one MCP call. Use view='services' for a service list, view='clients' to get services grouped by client, or view='products' to get services grouped by product. Use page_size and offset for pagination; when has_more=true, call again with the same filters and offset=next_offset. Set include_client_details=true with view='clients' or view='services' when basic client identity fields are needed. Version: ${TOOL_VERSION}`,
+      { ...searchServicesSchema.shape, ...AUTH_SHAPE },
+      async (params) => {
+        const toolLogger = logger.child();
+        const startTime = Date.now();
+
+        try {
+          const authError = ensureToolAuth(params as Record<string, unknown>) as ToolResponse | null;
+          if (authError) return authError;
+
+          toolLogger.logToolCall('search_services', params, false);
+
+          if (!rateLimiter.tryConsume()) {
+            throw new RateLimitError();
+          }
+
+          const parsedParams = searchServicesSchema.parse(params);
+          const primaryFilterPresent = hasPrimaryFilter(parsedParams);
+
+          if (!primaryFilterPresent && !parsedParams.allow_broad_search) {
+            return toolError('At least one filter is required unless allow_broad_search=true.');
+          }
+
+          const scopeResolution = resolveScopedClientIds(parsedParams);
+          if (scopeResolution.error) {
+            return scopeResolution.error;
+          }
+
+          const scopedClientIds = scopeResolution.clientids;
+          const queries = buildNativeQueries(parsedParams, scopedClientIds);
+          const warnings: string[] = [];
+
+          if (!primaryFilterPresent && parsedParams.allow_broad_search) {
+            warnings.push('Broad search executed because allow_broad_search=true.');
+          }
+
+          if (parsedParams.statuses?.length || parsedParams.domain_contains) {
+            warnings.push('Local filters were applied after fetching WHMCS records.');
+          }
+
+          const recordsByServiceId = new Map<number, WhmcsServiceRecord>();
+
+          for (const query of queries) {
+            const pageRecords = await fetchProductsForQuery(whmcsClient, query);
+
+            for (const record of pageRecords) {
+              const serviceId = toNullableNumber(record.id);
+              if (serviceId === null) {
+                continue;
+              }
+
+              if (!matchesFilters(record, parsedParams, scopedClientIds)) {
+                continue;
+              }
+
+              if (!recordsByServiceId.has(serviceId)) {
+                recordsByServiceId.set(serviceId, record);
+              }
+            }
+          }
+
+          let services = Array.from(recordsByServiceId.values())
+            .map((record) => normalizeService(record, parsedParams))
+            .filter((service): service is NormalizedService => service !== null);
+
+          if (isClientMode() && scopedClientIds) {
+            services = services.filter((service) => scopedClientIds.includes(service.clientid));
+          }
+
+          services.sort((left, right) => compareServices(left, right, parsedParams.sort_by, parsedParams.sort_order));
+
+          if (services.length === 0) {
+            warnings.push('No matching services were found.');
+          }
+
+          const filtersApplied = buildFiltersApplied(parsedParams, scopedClientIds);
+          const totalMatched = services.length;
+
+          if (parsedParams.view === 'services') {
+            const pagedServices = services.slice(parsedParams.offset, parsedParams.offset + parsedParams.page_size);
+            let responseServices = pagedServices;
+
+            if (parsedParams.include_client_details && pagedServices.length > 0) {
+              const clientDetailResult = await fetchClientDetails(
+                whmcsClient,
+                pagedServices.map((service) => service.clientid)
+              );
+              warnings.push(...clientDetailResult.warnings);
+              responseServices = attachClientDetails(pagedServices, clientDetailResult.details);
+            }
+
+            const hasMore = parsedParams.offset + parsedParams.page_size < totalMatched;
+            const response = {
+              view: 'services' as const,
+              services: responseServices,
+              total_matched: totalMatched,
+              returned: responseServices.length,
+              offset: parsedParams.offset,
+              page_size: parsedParams.page_size,
+              has_more: hasMore,
+              ...(hasMore ? { next_offset: parsedParams.offset + parsedParams.page_size } : {}),
+              filters_applied: filtersApplied,
+              ...(finalizeWarnings(warnings) ? { warnings: finalizeWarnings(warnings) } : {}),
+            };
+
+            toolLogger.logToolResult('search_services', true, Date.now() - startTime);
+
+            return {
+              content: [{
+                type: 'text' as const,
+                text: JSON.stringify(response),
+              }],
+            };
+          }
+
+          if (parsedParams.view === 'clients') {
+            const clientGroups = buildClientGroups(services);
+            const pagedGroups = clientGroups.slice(parsedParams.offset, parsedParams.offset + parsedParams.page_size);
+
+            if (parsedParams.include_client_details && pagedGroups.length > 0) {
+              const clientDetailResult = await fetchClientDetails(
+                whmcsClient,
+                pagedGroups.map((group) => group.clientid)
+              );
+
+              warnings.push(...clientDetailResult.warnings);
+
+              for (const group of pagedGroups) {
+                const client = clientDetailResult.details.get(group.clientid);
+                if (client) {
+                  group.client = client;
+                }
+                group.services = attachClientDetails(group.services, clientDetailResult.details);
+              }
+            }
+
+            const hasMore = parsedParams.offset + parsedParams.page_size < clientGroups.length;
+            const response = {
+              view: 'clients' as const,
+              clients: pagedGroups,
+              total_matched: totalMatched,
+              total_clients: clientGroups.length,
+              returned: pagedGroups.length,
+              offset: parsedParams.offset,
+              page_size: parsedParams.page_size,
+              has_more: hasMore,
+              ...(hasMore ? { next_offset: parsedParams.offset + parsedParams.page_size } : {}),
+              filters_applied: filtersApplied,
+              ...(finalizeWarnings(warnings) ? { warnings: finalizeWarnings(warnings) } : {}),
+            };
+
+            toolLogger.logToolResult('search_services', true, Date.now() - startTime);
+
+            return {
+              content: [{
+                type: 'text' as const,
+                text: JSON.stringify(response),
+              }],
+            };
+          }
+
+          const productGroups = buildProductGroups(services);
+          const pagedGroups = productGroups.slice(parsedParams.offset, parsedParams.offset + parsedParams.page_size);
+
+          if (parsedParams.include_client_details && pagedGroups.length > 0) {
+            const clientIds = pagedGroups.flatMap((group) => group.clientids);
+            const clientDetailResult = await fetchClientDetails(whmcsClient, clientIds);
+            warnings.push(...clientDetailResult.warnings);
+
+            for (const group of pagedGroups) {
+              group.services = attachClientDetails(group.services, clientDetailResult.details);
+            }
+          }
+
+          const hasMore = parsedParams.offset + parsedParams.page_size < productGroups.length;
+          const response = {
+            view: 'products' as const,
+            products: pagedGroups,
+            total_matched: totalMatched,
+            total_products: productGroups.length,
+            returned: pagedGroups.length,
+            offset: parsedParams.offset,
+            page_size: parsedParams.page_size,
+            has_more: hasMore,
+            ...(hasMore ? { next_offset: parsedParams.offset + parsedParams.page_size } : {}),
+            filters_applied: filtersApplied,
+            ...(finalizeWarnings(warnings) ? { warnings: finalizeWarnings(warnings) } : {}),
+          };
+
+          toolLogger.logToolResult('search_services', true, Date.now() - startTime);
+
+          return {
+            content: [{
+              type: 'text' as const,
+              text: JSON.stringify(response),
+            }],
+          };
+        } catch (error) {
+          toolLogger.logToolResult('search_services', false, Date.now() - startTime,
+            error instanceof Error ? error.message : String(error));
+
+          if (error instanceof RateLimitError || error instanceof WhmcsBusinessError) {
+            return {
+              content: [{ type: 'text' as const, text: JSON.stringify({ isError: true, error: error.message }) }],
+              isError: true,
+            };
+          }
+
+          throw error;
+        }
+      }
+    );
+  }
   
   // ============================================
   // Tool: suspend_service
@@ -85,7 +1159,7 @@ export function registerServiceTools(
           
           await whmcsClient.mutate('ModuleSuspend', {
             serviceid: params.serviceid,
-            suspendreason: params.reason || 'Suspended via MCP',
+            suspendreason: params.reason ?? 'Suspended via MCP',
           });
           
           toolLogger.logToolResult('suspend_service', true, Date.now() - startTime);
@@ -96,7 +1170,7 @@ export function registerServiceTools(
               text: JSON.stringify({
                 serviceid: params.serviceid,
                 status: 'Suspended',
-                reason: params.reason || 'Suspended via MCP',
+                reason: params.reason ?? 'Suspended via MCP',
                 success: true,
               }),
             }],
@@ -238,7 +1312,7 @@ export function registerServiceTools(
           
           // Check for unpaid invoices
           const clientInvoices = await whmcsClient.read<{
-            invoices?: { invoice?: Array<{ id: number; status: string; total: string }> };
+            invoices?: { invoice?: { id: number; status: string; total: string }[] };
             totalresults?: number;
           }>('GetInvoices', {
             userid: serviceDetails.clientid,
