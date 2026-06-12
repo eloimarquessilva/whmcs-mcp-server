@@ -171,3 +171,49 @@ describe('list_services — opaque cursor pagination', () => {
     expect(p.offset).toBe(0);
   });
 });
+
+describe('list_services — MRR estimation (restored from PR #4 originals)', () => {
+  it('normalizes recurring amounts to monthly per item and sums envelope MRR', async () => {
+    const { server, handlers, logger, rateLimiter } = harness();
+    const all = [
+      { id: 1, userid: 30, name: 'svc1', status: 'Active', billingcycle: 'Monthly', recurringamount: '10.00' },
+      { id: 2, userid: 31, name: 'svc2', status: 'Active', billingcycle: 'Annually', recurringamount: '120.00' },
+      { id: 3, userid: 32, name: 'svc3', status: 'Active', billingcycle: 'Quarterly', recurringamount: '30.00' },
+      { id: 4, userid: 33, name: 'svc4', status: 'Active', billingcycle: 'One Time', recurringamount: '99.00' },
+    ];
+    const read = pagedReader(all, 'products');
+    registerReportingListTools(server as any, { read } as any, logger, rateLimiter);
+
+    const r = await handlers.list_services(svcArgs({ limit: 10, offset: 0 }));
+    const p = JSON.parse(r.content[0].text);
+
+    const byId = Object.fromEntries(p.items.map((s: any) => [s.serviceid, s]));
+    expect(byId[1].estimated_monthly_recurring).toBe(10);
+    expect(byId[2].estimated_monthly_recurring).toBe(10);
+    expect(byId[3].estimated_monthly_recurring).toBe(10);
+    expect(byId[4].estimated_monthly_recurring).toBe(0); // one-time cycles contribute 0
+
+    expect(p.recurring_total_raw).toBe(259);
+    expect(p.estimated_monthly_recurring).toBe(30);
+  });
+
+  it('envelope MRR covers ALL matched services, not just the returned page', async () => {
+    const { server, handlers, logger, rateLimiter } = harness();
+    const all = Array.from({ length: 6 }, (_, i) => ({
+      id: i + 1,
+      userid: 30 + i,
+      name: `svc${String(i + 1)}`,
+      status: 'Active',
+      billingcycle: 'Monthly',
+      recurringamount: '5.00',
+    }));
+    const read = pagedReader(all, 'products');
+    registerReportingListTools(server as any, { read } as any, logger, rateLimiter);
+
+    const r = await handlers.list_services(svcArgs({ limit: 2, offset: 0 }));
+    const p = JSON.parse(r.content[0].text);
+    expect(p.items).toHaveLength(2);
+    expect(p.estimated_monthly_recurring).toBe(30);
+    expect(p.recurring_total_raw).toBe(30);
+  });
+});

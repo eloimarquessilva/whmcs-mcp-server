@@ -105,6 +105,31 @@ function mapInvoiceSummary(invoice: WhmcsInvoiceSummary) {
   };
 }
 
+/**
+ * Normalize a service's recurring amount to a monthly figure by billing cycle.
+ * Cycles WHMCS does not bill recurrently (one-time, free) contribute 0.
+ */
+function monthlyRecurringAmount(service: WhmcsServiceSummary): number {
+  const amount = parseNumber(service.recurringamount ?? '0');
+  switch ((service.billingcycle ?? '').toLowerCase()) {
+    case 'monthly':
+      return amount;
+    case 'quarterly':
+      return amount / 3;
+    case 'semi-annually':
+    case 'semiannually':
+      return amount / 6;
+    case 'annually':
+      return amount / 12;
+    case 'biennially':
+      return amount / 24;
+    case 'triennially':
+      return amount / 36;
+    default:
+      return 0;
+  }
+}
+
 function mapServiceSummary(service: WhmcsServiceSummary) {
   return {
     serviceid: service.id,
@@ -116,6 +141,7 @@ function mapServiceSummary(service: WhmcsServiceSummary) {
     billing_cycle: service.billingcycle,
     next_due_date: service.nextduedate,
     recurring_amount: service.recurringamount,
+    estimated_monthly_recurring: Number(monthlyRecurringAmount(service).toFixed(2)),
     payment_method: service.paymentmethod,
   };
 }
@@ -486,12 +512,20 @@ export function registerReportingListTools(
           ...(nextCursor !== undefined ? { nextCursor } : {}),
           paying_only: params.paying_only,
           unique_client_count: uniqueClientIds.size,
+          recurring_total_raw: Number(
+            filtered
+              .reduce((sum, s) => sum + parseNumber(s.recurringamount ?? '0'), 0)
+              .toFixed(2)
+          ),
+          estimated_monthly_recurring: Number(
+            filtered.reduce((sum, s) => sum + monthlyRecurringAmount(s), 0).toFixed(2)
+          ),
           scanned: rawServices.length,
           scan_limit: params.scan_limit,
           complete_scan: completeScan,
           status: params.status ?? null,
           clientid: params.clientid ?? null,
-          note: 'For currently paying clients use status=Active and paying_only=true; unique_client_count is distinct clients with active paid services.',
+          note: 'For currently paying clients use status=Active and paying_only=true; unique_client_count is distinct clients with active paid services. estimated_monthly_recurring normalizes recurring amounts to monthly (MRR) across all matched services.',
         };
 
         log.logToolResult('list_services', true, Date.now() - t0);
