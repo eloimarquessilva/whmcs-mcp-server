@@ -55,7 +55,7 @@ function harness() {
     // Write tools use the older SDK `server.tool()` signature; they are NOT
     // part of the governance-OFF legacy-path bug, so the compliance sweep
     // intentionally ignores them.
-    tool: () => {},
+    tool: () => { },
   };
   const childLogger: Record<string, unknown> = {
     logToolCall: vi.fn(),
@@ -106,8 +106,8 @@ describe('MCP outputSchema compliance (governance OFF) — RCA #4 guardrail', ()
     registerBillingTools(h.server as any, h.whmcs, h.logger, h.rl);
     registerDomainTools(h.server as any, h.whmcs, h.logger, h.rl);
     registerOrderTools(h.server as any, h.whmcs, h.logger, h.rl);
-    registerReportingListTools(h.server as any, h.whmcs, h.logger, h.rl);
-    registerSearchServicesTool(h.server as any, h.whmcs, h.logger, h.rl);
+    registerReportingListTools(h.server as any, h.whmcs, h.logger as any, h.rl as any);
+    registerSearchServicesTool(h.server as any, h.whmcs, h.logger as any, h.rl as any);
 
     const names = Object.keys(h.handlers).filter((n) => h.configs[n]?.outputSchema);
     expect(names.length).toBeGreaterThan(15);
