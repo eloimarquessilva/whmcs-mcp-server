@@ -20,23 +20,16 @@ import { WhmcsClient, WhmcsBusinessError } from '../whmcs/WhmcsClient.js';
 import { Logger } from '../logging.js';
 import { RateLimiter, RateLimitError } from '../rateLimiter.js';
 import { config, isToolAllowed } from '../config.js';
-import {
-  ensureToolAuth,
-  isClientMode,
-  ensureClientAllowed,
-  AUTH_SHAPE,
-} from '../security.js';
+import { ensureToolAuth, isClientMode, ensureClientAllowed, AUTH_SHAPE } from '../security.js';
 import { normalizeToArray } from '../whmcs/normalizers.js';
-import {
-  READ_ONLY_ANNOTATIONS,
-  LIST_TOOL_OUTPUT_SCHEMA,
-  encodeCursor,
-  decodeCursor,
-} from './listTools.js';
+import { READ_ONLY_ANNOTATIONS, LIST_TOOL_OUTPUT_SCHEMA } from './listTools.js';
 import {
   applyGovernanceOrLegacy,
   governedListResult,
+  governListProjection,
   governanceEnabled,
+  getProjectionEnv,
+  getConsumerRegistry,
 } from '../governance/pipeline.js';
 import { mapToCanonicalService } from '../canonical/index.js';
 
@@ -128,6 +121,13 @@ export const searchServicesSchema = z.object({
   include_custom_fields: z.boolean().default(false),
   include_config_options: z.boolean().default(false),
 
+  include_group_services: z
+    .boolean()
+    .default(false)
+    .describe(
+      "Group views only ('clients'/'products'): when true, nest the full (or projected) service rows inside each group. Default false returns each group as ids and counts (serviceids[]) without the nested services, keeping the payload small."
+    ),
+
   limit: z
     .number()
     .int()
@@ -172,6 +172,7 @@ export const searchServicesSchema = z.object({
 type SearchServicesParams = z.infer<typeof searchServicesSchema>;
 type SortBy = SearchServicesParams['sort_by'];
 type SortOrder = SearchServicesParams['sort_order'];
+type ViewType = SearchServicesParams['view'];
 
 interface WhmcsServiceRecord {
   id?: unknown;
@@ -311,11 +312,18 @@ interface ToolResponse {
   isError?: boolean;
 }
 
+/**
+ * Error responses mirror the rest of the repo's read tools: human-readable
+ * `content` + `isError`, but NO `structuredContent`. Emitting structuredContent
+ * here would make a strict MCP runtime validate the error payload against the
+ * success `outputSchema` (which requires items/total/count/offset/limit) and
+ * reject it. (Governed consumer-denied errors keep structuredContent — they go
+ * through the governance pipeline, not this helper.)
+ */
 function toolError(message: string, extra?: Record<string, unknown>): ToolResponse {
   const payload = { isError: true, error: message, ...(extra ?? {}) };
   return {
     content: [{ type: 'text' as const, text: JSON.stringify(payload) }],
-    structuredContent: payload,
     isError: true,
   };
 }
@@ -370,16 +378,83 @@ function toComparableString(value: unknown): string | null {
   return normalized ? normalized.toLowerCase() : null;
 }
 
-function hasPrimaryFilter(params: SearchServicesParams): boolean {
+/**
+ * A NATIVE primary filter is one that narrows the WHMCS query itself
+ * (serviceids/product_ids/clientids/domains/usernames). `statuses` and
+ * `domain_contains` are applied LOCALLY after fetching and do NOT reduce the
+ * backend scan, so they must not satisfy the broad-search guard.
+ */
+function hasNativePrimaryFilter(params: SearchServicesParams): boolean {
   return [
     params.serviceids?.length ?? 0,
     params.product_ids?.length ?? 0,
     params.clientids?.length ?? 0,
     params.domains?.length ?? 0,
     params.usernames?.length ?? 0,
-    params.statuses?.length ?? 0,
-    params.domain_contains?.length ?? 0,
   ].some((value) => value > 0);
+}
+
+/** Local-only filters: honoured client-side, never narrow the WHMCS query. */
+function hasLocalFilter(params: SearchServicesParams): boolean {
+  return (params.statuses?.length ?? 0) > 0 || (params.domain_contains?.length ?? 0) > 0;
+}
+
+/**
+ * Product of the de-duplicated cardinalities of every native filter dimension
+ * — i.e. how many GetClientsProducts queries the fan-out WOULD create —
+ * computed WITHOUT materializing the cartesian product, so an oversized
+ * request is rejected before any memory is spent (worst case 100^5).
+ */
+function nativeCombinationCount(params: SearchServicesParams, scopedClientIds?: number[]): number {
+  const cardinalities = [
+    uniqueValues(params.serviceids)?.length,
+    uniqueValues(params.product_ids)?.length,
+    scopedClientIds?.length,
+    uniqueValues(params.domains)?.length,
+    uniqueValues(params.usernames)?.length,
+  ].filter((value): value is number => typeof value === 'number' && value > 0);
+
+  return cardinalities.reduce((product, value) => product * value, 1);
+}
+
+/**
+ * View-tagged opaque cursor, LOCAL to search_services (the shared
+ * encode/decodeCursor in listTools are reused by other tools and must stay
+ * view-agnostic). Encodes `{ offset, view }`; a cursor minted for a different
+ * view decodes to the first page and flags `viewMismatch` so the caller can
+ * warn. Legacy offset-only cursors (no `view`) are still accepted.
+ */
+function encodeSearchServicesCursor(offset: number, view: ViewType): string {
+  const safe = Number.isFinite(offset) && offset > 0 ? Math.floor(offset) : 0;
+  return Buffer.from(JSON.stringify({ offset: safe, view }), 'utf8').toString('base64');
+}
+
+function decodeSearchServicesCursor(
+  token: string | undefined,
+  expectedView: ViewType
+): { offset: number; viewMismatch: boolean } {
+  if (typeof token !== 'string' || token.length === 0) {
+    return { offset: 0, viewMismatch: false };
+  }
+  try {
+    const parsed: unknown = JSON.parse(Buffer.from(token, 'base64').toString('utf8'));
+    if (parsed === null || typeof parsed !== 'object') {
+      return { offset: 0, viewMismatch: false };
+    }
+    const record = parsed as Record<string, unknown>;
+    const rawOffset = record.offset;
+    const offset =
+      typeof rawOffset === 'number' && Number.isFinite(rawOffset) && rawOffset >= 0
+        ? Math.floor(rawOffset)
+        : 0;
+    const cursorView = record.view;
+    if (typeof cursorView === 'string' && cursorView !== expectedView) {
+      return { offset: 0, viewMismatch: true };
+    }
+    return { offset, viewMismatch: false };
+  } catch {
+    return { offset: 0, viewMismatch: false };
+  }
 }
 
 /**
@@ -461,13 +536,25 @@ function buildNativeQueries(
   });
 }
 
+/** Read one WHMCS page, consuming a rate-limit token first (1 token / read). */
+async function readWithRateLimit<T>(
+  whmcsClient: WhmcsClient,
+  rl: RateLimiter,
+  action: string,
+  params: Record<string, unknown>
+): Promise<T> {
+  if (!rl.tryConsume()) throw new RateLimitError();
+  return whmcsClient.read<T>(action, params);
+}
+
 /**
  * Drain all WHMCS pages for one native query, bounded by the caller's
  * remaining scan budget. Returns the records plus whether the query was
- * exhausted within budget.
+ * exhausted within budget. Every page consumes a rate-limit token (1.1).
  */
 async function fetchProductsForQuery(
   whmcsClient: WhmcsClient,
+  rl: RateLimiter,
   query: Record<string, unknown>,
   scanBudget: number
 ): Promise<{ records: WhmcsServiceRecord[]; exhausted: boolean }> {
@@ -476,13 +563,13 @@ async function fetchProductsForQuery(
   let limitstart = 0;
 
   while (records.length < scanBudget) {
-    const response = await whmcsClient.read<WhmcsGetClientsProductsResponse>(
+    // The amount THIS iteration actually asks WHMCS for (trimmed by budget).
+    const requestedLimit = Math.min(limitnum, scanBudget - records.length);
+    const response = await readWithRateLimit<WhmcsGetClientsProductsResponse>(
+      whmcsClient,
+      rl,
       'GetClientsProducts',
-      {
-        ...query,
-        limitstart,
-        limitnum: Math.min(limitnum, scanBudget - records.length),
-      }
+      { ...query, limitstart, limitnum: requestedLimit }
     );
 
     const pageRecords = normalizeToArray<WhmcsServiceRecord>(response.products?.product);
@@ -492,9 +579,7 @@ async function fetchProductsForQuery(
     const totalresults = toNullableNumber(response.totalresults);
     const startnumber = toNullableNumber(response.startnumber);
 
-    if (pageRecords.length === 0 || numreturned < Math.min(limitnum, scanBudget)) {
-      return { records, exhausted: true };
-    }
+    // Authoritative proof of exhaustion: WHMCS says this page reaches the end.
     if (
       startnumber !== null &&
       totalresults !== null &&
@@ -502,10 +587,18 @@ async function fetchProductsForQuery(
     ) {
       return { records, exhausted: true };
     }
+    // Empty page, or a page shorter than what THIS iteration requested, means
+    // the source drained. Comparing against `requestedLimit` (budget-trimmed)
+    // rather than the full page size avoids falsely claiming exhaustion when we
+    // only stopped because the scan budget ran out (3.2 / P2).
+    if (pageRecords.length === 0 || numreturned < requestedLimit) {
+      return { records, exhausted: true };
+    }
 
     limitstart += pageRecords.length;
   }
 
+  // Hit the scan budget without proof of exhaustion ⇒ more rows may remain.
   return { records, exhausted: false };
 }
 
@@ -515,7 +608,9 @@ function normalizeCustomFields(value: unknown): { id?: number; name?: string; va
     .map((field) => {
       const normalizedField: { id?: number; name?: string; value?: string } = {};
       const id = toNullableNumber(field.id);
-      const name = toNullableString(field.name);
+      // WHMCS uses `name` on some endpoints and `fieldname` on others; accept
+      // either, mirroring the canonical mapper (2.3 / G3).
+      const name = toNullableString(field.name) ?? toNullableString(field.fieldname);
       const fieldValue = toNullableString(field.value);
       if (id !== null) normalizedField.id = id;
       if (name !== null) normalizedField.name = name;
@@ -545,6 +640,13 @@ function normalizeConfigOptions(
     .filter((option) => Object.keys(option).length > 0);
 }
 
+/**
+ * Re-applies EVERY filter locally even though each fanned-out native query is
+ * already fully constrained. This re-check is intentional defense-in-depth
+ * (5.4 / C4): it guards against a backend that ignores or loosely honours a
+ * scalar filter, and the cost is negligible (records are already in memory,
+ * bounded by MAX_SEARCH_SCAN). Do NOT remove it as a "redundant" optimisation.
+ */
 function matchesFilters(
   record: WhmcsServiceRecord,
   params: SearchServicesParams,
@@ -678,12 +780,7 @@ function compareServices(
       case 'clientid':
         return compareNullableValues(left.clientid, right.clientid, compareNumbers, sortOrder);
       case 'product_id':
-        return compareNullableValues(
-          left.product_id,
-          right.product_id,
-          compareNumbers,
-          sortOrder
-        );
+        return compareNullableValues(left.product_id, right.product_id, compareNumbers, sortOrder);
       case 'next_due_date':
         return compareNullableValues(
           left.next_due_date,
@@ -704,18 +801,30 @@ function compareServices(
   return left.clientid - right.clientid;
 }
 
+/**
+ * Optional client-identity enrichment (opt-in via include_client_details).
+ * Each read consumes a rate-limit token (1.1). Because this enrichment is
+ * OPTIONAL, it degrades gracefully (1.4): a `RateLimitError` mid-enrichment
+ * stops the loop and returns whatever was gathered with `partial: true` — it
+ * NEVER aborts the search. Client ids are de-duplicated before fetching.
+ */
 async function fetchClientDetails(
   whmcsClient: WhmcsClient,
+  rl: RateLimiter,
   clientIds: number[]
-): Promise<{ details: Map<number, BasicClientDetails>; warnings: string[] }> {
+): Promise<{ details: Map<number, BasicClientDetails>; warnings: string[]; partial: boolean }> {
   const details = new Map<number, BasicClientDetails>();
   const warnings: string[] = [];
+  let partial = false;
 
   for (const clientId of uniqueValues(clientIds) ?? []) {
     try {
-      const response = await whmcsClient.read<WhmcsClientDetailsResponse>('GetClientsDetails', {
-        clientid: clientId,
-      });
+      const response = await readWithRateLimit<WhmcsClientDetailsResponse>(
+        whmcsClient,
+        rl,
+        'GetClientsDetails',
+        { clientid: clientId }
+      );
 
       const firstname = toNullableString(response.firstname) ?? '';
       const lastname = toNullableString(response.lastname) ?? '';
@@ -732,6 +841,14 @@ async function fetchClientDetails(
         status: toNullableString(response.status) ?? 'Unknown',
       });
     } catch (error) {
+      // Rate limit during OPTIONAL enrichment ⇒ degrade, do not abort (1.4).
+      if (error instanceof RateLimitError) {
+        warnings.push(
+          'Client enrichment stopped early: rate limit reached; some services are returned without client details.'
+        );
+        partial = true;
+        break;
+      }
       if (error instanceof WhmcsBusinessError) {
         warnings.push(`Client details could not be enriched for clientid ${clientId}.`);
         continue;
@@ -740,7 +857,7 @@ async function fetchClientDetails(
     }
   }
 
-  return { details, warnings };
+  return { details, warnings, partial };
 }
 
 function attachClientDetails(
@@ -838,15 +955,32 @@ function finalizeWarnings(warnings: string[]): string[] | undefined {
   return uniqueWarnings && uniqueWarnings.length > 0 ? uniqueWarnings : undefined;
 }
 
-/** Strip nested service rows from group summaries for governed responses. */
-function groupSummaryIdsOnly(
-  group: ClientGroup | ProductGroup
-): Record<string, unknown> {
+/**
+ * Reduce a group to an ids/counts-only summary safe for governed output.
+ * Strips the nested service rows AND every business DISPLAY label
+ * (product_name/group_name and their translations) so nothing beyond
+ * identifiers (business.identifier) and counts crosses the boundary — these
+ * summaries can therefore be emitted directly as governed `items` without
+ * per-row projection.
+ */
+function groupSummaryIdsOnly(group: ClientGroup | ProductGroup): Record<string, unknown> {
   const { services: _services, ...summary } = group as unknown as Record<string, unknown> & {
     services: unknown;
   };
   delete (summary as { client?: unknown }).client;
+  delete (summary as { product_name?: unknown }).product_name;
+  delete (summary as { translated_product_name?: unknown }).translated_product_name;
+  delete (summary as { group_name?: unknown }).group_name;
+  delete (summary as { translated_group_name?: unknown }).translated_group_name;
   return summary;
+}
+
+/** Legacy group item without the nested service rows (include_group_services=false). */
+function stripGroupServices(group: ClientGroup | ProductGroup): Record<string, unknown> {
+  const { services: _services, ...rest } = group as unknown as Record<string, unknown> & {
+    services: unknown;
+  };
+  return rest;
 }
 
 export function registerSearchServicesTool(
@@ -862,8 +996,7 @@ export function registerSearchServicesTool(
     const t0 = Date.now();
 
     try {
-      const authToken =
-        typeof rawParams.auth_token === 'string' ? rawParams.auth_token : undefined;
+      const authToken = typeof rawParams.auth_token === 'string' ? rawParams.auth_token : undefined;
 
       const authErr = ensureToolAuth(rawParams);
       if (authErr) return authErr;
@@ -873,28 +1006,46 @@ export function registerSearchServicesTool(
 
       const params = searchServicesSchema.parse(rawParams);
       const requestedContract = params.contract;
-      const primaryFilterPresent = hasPrimaryFilter(params);
+      const nativeFilterPresent = hasNativePrimaryFilter(params);
 
-      if (!primaryFilterPresent && !params.allow_broad_search) {
-        return toolError('At least one filter is required unless allow_broad_search=true.');
+      // Local-only filters (statuses/domain_contains) do NOT narrow the WHMCS
+      // query, so they must not satisfy the broad-search guard (1.3 / E3).
+      if (!nativeFilterPresent && !params.allow_broad_search) {
+        return toolError(
+          'At least one native filter (serviceids, product_ids, clientids, domains, or usernames) is required unless allow_broad_search=true. Local-only filters (statuses, domain_contains) do not narrow the WHMCS query.'
+        );
       }
 
       const scopeResolution = resolveScopedClientIds(params);
       if (scopeResolution.error) return scopeResolution.error;
 
       const scopedClientIds = scopeResolution.clientids;
-      const queries = buildNativeQueries(params, scopedClientIds);
-      if (queries.length > MAX_QUERY_COMBINATIONS) {
+
+      // Preflight the fan-out BEFORE materializing the cartesian product so an
+      // oversized request can never blow up memory (1.2 / E2). The count is the
+      // product of the de-duplicated native cardinalities.
+      const combinationCount = nativeCombinationCount(params, scopedClientIds);
+      if (combinationCount > MAX_QUERY_COMBINATIONS) {
+        // Audit event (5.3): an agent tried to brute-force the API.
+        log.warn('search_services: fan-out rejected', {
+          combinationCount,
+          max: MAX_QUERY_COMBINATIONS,
+          view: params.view,
+        });
         return toolError(
-          `Filter fan-out produces ${queries.length} WHMCS queries (max ${MAX_QUERY_COMBINATIONS}). Narrow the array filters or split the search.`
+          `Filter fan-out produces ${combinationCount} WHMCS queries (max ${MAX_QUERY_COMBINATIONS}). Narrow the array filters or split the search.`
         );
       }
 
+      const queries = buildNativeQueries(params, scopedClientIds);
+
       const warnings: string[] = [];
-      if (!primaryFilterPresent && params.allow_broad_search) {
+      if (!nativeFilterPresent && params.allow_broad_search) {
         warnings.push('Broad search executed because allow_broad_search=true.');
+        // Audit event (5.3): a global scan was authorised.
+        log.info('search_services: broad search executed', { view: params.view });
       }
-      if (params.statuses?.length || params.domain_contains) {
+      if (hasLocalFilter(params)) {
         warnings.push('Local filters were applied after fetching WHMCS records.');
       }
 
@@ -904,11 +1055,24 @@ export function registerSearchServicesTool(
           'include_client_details is ignored when governance is enabled; use get_client_details for governed client data.'
         );
       }
+      // Data-minimisation gate (5.1): when MCP_ALLOW_CLIENT_ENRICHMENT is false,
+      // inline client enrichment is suppressed in the non-governed path. The
+      // config resolves unset ⇒ true (preserves current admin behaviour).
+      const enrichmentAllowed = config.MCP_ALLOW_CLIENT_ENRICHMENT;
+      if (!governed && params.include_client_details && !enrichmentAllowed) {
+        warnings.push(
+          'include_client_details is ignored because MCP_ALLOW_CLIENT_ENRICHMENT is disabled.'
+        );
+      }
 
       const recordsByServiceId = new Map<number, WhmcsServiceRecord>();
       let scanned = 0;
       let completeScan = true;
 
+      // Sequential by design (5.5 / C3): each query drains its own pages and
+      // every page consumes a rate-limit token, so the WHMCS API is never hit
+      // by a parallel burst. Bounded parallelism is a deliberate non-goal here —
+      // it would reintroduce the rate-limit pressure the per-page gate removes.
       for (const query of queries) {
         const budget = MAX_SEARCH_SCAN - scanned;
         if (budget <= 0) {
@@ -918,6 +1082,7 @@ export function registerSearchServicesTool(
 
         const { records: pageRecords, exhausted } = await fetchProductsForQuery(
           whmcs,
+          rl,
           query,
           budget
         );
@@ -938,6 +1103,13 @@ export function registerSearchServicesTool(
         warnings.push(
           `Scan stopped at ${MAX_SEARCH_SCAN} records; results may be partial. Narrow the filters.`
         );
+        // Audit event (5.3): results may be partial — operators can tune limits.
+        log.warn('search_services: partial scan', {
+          view: params.view,
+          scanned,
+          scan_limit: MAX_SEARCH_SCAN,
+          query_count: queries.length,
+        });
       }
 
       let services = Array.from(recordsByServiceId.values())
@@ -958,19 +1130,52 @@ export function registerSearchServicesTool(
 
       const filtersApplied = buildFiltersApplied(params, scopedClientIds);
       const totalMatched = services.length;
-      const effectiveOffset =
-        typeof params.cursor === 'string' ? decodeCursor(params.cursor) : params.offset;
+      // View-tagged cursor: a cursor minted for another view resets to page 0
+      // and warns instead of silently mis-paging across views (3.3 / P3).
+      const cursorResult =
+        typeof params.cursor === 'string'
+          ? decodeSearchServicesCursor(params.cursor, params.view)
+          : { offset: params.offset, viewMismatch: false };
+      const effectiveOffset = cursorResult.offset;
+      if (cursorResult.viewMismatch) {
+        warnings.push(
+          'Pagination cursor was issued for a different view; it was ignored and the first page is returned.'
+        );
+      }
 
       const rawByServiceId = (page: NormalizedService[]): WhmcsServiceRecord[] =>
         page
           .map((service) => recordsByServiceId.get(service.serviceid))
           .filter((record): record is WhmcsServiceRecord => record !== undefined);
 
+      // Governed list projection bound to this call's consumer/contract. Used
+      // for the bespoke governed group path (2.2): resolve the consumer once
+      // (rows=[]) for the deny gate, then project each group's services.
+      const projectRows = (rows: readonly WhmcsServiceRecord[]) =>
+        governListProjection({
+          rows,
+          mapItem: mapToCanonicalService,
+          authToken,
+          env: getProjectionEnv(),
+          registry: getConsumerRegistry(),
+          allowAnon: config.MCP_ALLOW_ANON_LLM,
+          requestedContract,
+        });
+
+      const govError = (r: { error?: string; status?: string }): ToolResponse => {
+        const payload = { isError: true, error: r.error, status: r.status };
+        return {
+          content: [{ type: 'text' as const, text: JSON.stringify(payload) }],
+          structuredContent: payload,
+          isError: true,
+        };
+      };
+
       const baseEnvelope = (unitTotal: number, count: number) => {
         const hasMore = effectiveOffset + count < unitTotal;
         const nextCursor =
           hasMore && count === params.limit
-            ? encodeCursor(effectiveOffset + count)
+            ? encodeSearchServicesCursor(effectiveOffset + count, params.view)
             : undefined;
         return {
           total: unitTotal,
@@ -989,18 +1194,26 @@ export function registerSearchServicesTool(
       if (params.view === 'services') {
         const page = services.slice(effectiveOffset, effectiveOffset + params.limit);
         let items = page;
+        let clientDetailsPartial = false;
 
-        if (!governed && params.include_client_details && page.length > 0) {
+        if (!governed && params.include_client_details && enrichmentAllowed && page.length > 0) {
           const enrichment = await fetchClientDetails(
             whmcs,
+            rl,
             page.map((service) => service.clientid)
           );
           warnings.push(...enrichment.warnings);
+          clientDetailsPartial = enrichment.partial;
+          if (enrichment.partial) {
+            // Audit event (5.3): enrichment degraded under rate-limit pressure.
+            log.warn('search_services: client enrichment degraded', { view: params.view });
+          }
           items = attachClientDetails(page, enrichment.details);
         }
 
         const envelope = {
           ...baseEnvelope(totalMatched, page.length),
+          ...(clientDetailsPartial ? { client_details_partial: true } : {}),
           ...(finalizeWarnings(warnings) ? { warnings: finalizeWarnings(warnings) } : {}),
         };
 
@@ -1025,12 +1238,23 @@ export function registerSearchServicesTool(
         params.view === 'clients' ? buildClientGroups(services) : buildProductGroups(services);
       const pagedGroups = groups.slice(effectiveOffset, effectiveOffset + params.limit);
 
-      if (!governed && params.include_client_details && pagedGroups.length > 0) {
+      let groupClientDetailsPartial = false;
+      if (
+        !governed &&
+        params.include_client_details &&
+        enrichmentAllowed &&
+        pagedGroups.length > 0
+      ) {
         const clientIds = pagedGroups.flatMap((group) =>
           'clientid' in group ? [group.clientid] : group.clientids
         );
-        const enrichment = await fetchClientDetails(whmcs, clientIds);
+        const enrichment = await fetchClientDetails(whmcs, rl, clientIds);
         warnings.push(...enrichment.warnings);
+        groupClientDetailsPartial = enrichment.partial;
+        if (enrichment.partial) {
+          // Audit event (5.3): enrichment degraded under rate-limit pressure.
+          log.warn('search_services: client enrichment degraded', { view: params.view });
+        }
 
         for (const group of pagedGroups) {
           if ('clientid' in group) {
@@ -1042,33 +1266,56 @@ export function registerSearchServicesTool(
       }
 
       const groupCountKey = params.view === 'clients' ? 'total_clients' : 'total_products';
+      // `count`/`total` count GROUPS in group views; `items` are groups too, so
+      // count === items.length holds on BOTH paths (2.2 / G2).
       const envelope = {
         ...baseEnvelope(groups.length, pagedGroups.length),
         [groupCountKey]: groups.length,
+        ...(groupClientDetailsPartial ? { client_details_partial: true } : {}),
         ...(finalizeWarnings(warnings) ? { warnings: finalizeWarnings(warnings) } : {}),
       };
 
       log.logToolResult('search_services', true, Date.now() - t0);
 
-      const legacy = { items: pagedGroups, ...envelope };
+      // Legacy items = groups. Nested service rows only under
+      // include_group_services (default false) to keep the payload small (3.1).
+      const legacyItems = params.include_group_services
+        ? pagedGroups
+        : pagedGroups.map(stripGroupServices);
+      const legacy = { items: legacyItems, ...envelope };
+
       return applyGovernanceOrLegacy({
         enabled: governed,
         legacy,
         govern: () => {
-          // Governed group views: items are the canonical-service projections of
-          // every service inside the paged groups; group summaries degrade to
-          // ids/counts only so no ungoverned service fields leak via the envelope.
-          const pageServices = pagedGroups.flatMap((group) => group.services);
-          return governedListResult({
-            rows: rawByServiceId(pageServices),
-            mapItem: mapToCanonicalService,
-            envelope: {
-              ...envelope,
-              groups: pagedGroups.map(groupSummaryIdsOnly),
-            },
-            authToken,
-            requestedContract,
+          // Bespoke governed group path (2.2 / V5): governedListResult always
+          // projects rows→items and has no "group" entity, so we build it here.
+          // Resolve the consumer ONCE (rows=[]) for the deny gate, then emit the
+          // ids/counts-only summaries as `items` (no per-row projection needed —
+          // they are business.identifier/counts). Nested services, when asked,
+          // are projected per group so each still crosses the boundary.
+          const gate = projectRows([]);
+          if (!gate.ok) return govError(gate);
+
+          const items = pagedGroups.map((group) => {
+            const summary = groupSummaryIdsOnly(group);
+            if (params.include_group_services) {
+              const projected = projectRows(rawByServiceId(group.services));
+              summary.services = projected.ok ? projected.items : [];
+            }
+            return summary;
           });
+
+          const payload = {
+            consumer: gate.consumer_id,
+            contract: gate.contract,
+            items,
+            ...envelope,
+          };
+          return {
+            content: [{ type: 'text' as const, text: JSON.stringify(payload) }],
+            structuredContent: payload,
+          };
         },
       });
     } catch (e) {
@@ -1088,7 +1335,7 @@ export function registerSearchServicesTool(
   server.registerTool(
     'search_services',
     {
-      description: `Search WHMCS client services/products via GetClientsProducts (read-only). Pass arrays such as product_ids, clientids, serviceids, domains, or usernames to search multiple values in one call; statuses and domain_contains filter locally. view='services' pages service rows, view='clients' groups by client, view='products' groups by product. Page with limit/offset or the opaque nextCursor. Version: ${TOOL_VERSION}`,
+      description: `Multi-filter discovery/lookup over WHMCS client services/products via GetClientsProducts (read-only). Prefer the cheaper tool when you can: use list_client_services when you already know the clientid, and list_client_invoices for billing. Reach for search_services for cross-client discovery — reverse lookup by domain/username, batch lookups by serviceids/product_ids, or grouping by client/product. Pass arrays such as product_ids, clientids, serviceids, domains, or usernames to search multiple values in one call; statuses and domain_contains filter locally. view='services' pages service rows; view='clients'/'products' page GROUPS (ids + counts), adding nested service rows only when include_group_services=true. Page with limit/offset or the opaque nextCursor (cursor is view-specific). Note: pagination is stateless — each page re-runs the fan-out and local scan, so prefer a larger limit over many small pages. Version: ${TOOL_VERSION}`,
       inputSchema: { ...searchServicesSchema.shape, ...AUTH_SHAPE },
       outputSchema: LIST_TOOL_OUTPUT_SCHEMA,
       annotations: { ...READ_ONLY_ANNOTATIONS },

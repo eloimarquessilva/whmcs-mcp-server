@@ -55,7 +55,7 @@ function harness() {
     // Write tools use the older SDK `server.tool()` signature; they are NOT
     // part of the governance-OFF legacy-path bug, so the compliance sweep
     // intentionally ignores them.
-    tool: () => { },
+    tool: () => {},
   };
   const childLogger: Record<string, unknown> = {
     logToolCall: vi.fn(),
@@ -196,6 +196,8 @@ describe('MCP strict-runtime outputSchema fidelity (real McpServer schema + ajv)
       registerBillingTools,
       registerDomainTools,
       registerOrderTools,
+      registerReportingListTools,
+      registerSearchServicesTool,
     ]) {
       try {
         reg(mcp as any, m.whmcs, m.logger, m.rl);
@@ -233,6 +235,8 @@ describe('MCP strict-runtime outputSchema fidelity (real McpServer schema + ajv)
     registerBillingTools(h.server as any, h.whmcs, h.logger, h.rl);
     registerDomainTools(h.server as any, h.whmcs, h.logger, h.rl);
     registerOrderTools(h.server as any, h.whmcs, h.logger, h.rl);
+    registerReportingListTools(h.server as any, h.whmcs, h.logger as any, h.rl as any);
+    registerSearchServicesTool(h.server as any, h.whmcs, h.logger as any, h.rl as any);
 
     const names = Object.keys(h.handlers).filter((n) => schemaByName.has(n));
     const cases: [string, Record<string, unknown>][] = names.map((n) => [n, argsFor(n)]);

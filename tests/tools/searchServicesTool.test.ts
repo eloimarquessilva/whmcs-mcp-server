@@ -18,6 +18,8 @@ const mockConfig = vi.hoisted(() => ({
   MCP_AUTH_TOKEN: undefined as string | undefined,
   MCP_GOVERNANCE_ENABLED: false,
   MCP_ALLOW_ANON_LLM: true,
+  MCP_ENV: 'production' as string,
+  MCP_ALLOW_CLIENT_ENRICHMENT: true,
 }));
 
 vi.mock('../../src/config.js', () => ({
@@ -31,6 +33,8 @@ import {
   searchServicesSchema,
 } from '../../src/tools/searchServicesTool.js';
 import { encodeCursor } from '../../src/tools/listTools.js';
+import { hashToken } from '../../src/governance/consumers.js';
+import { __resetRegistryCacheForTests } from '../../src/governance/pipeline.js';
 
 type FixtureRecord = Record<string, unknown>;
 
@@ -170,7 +174,10 @@ function createWhmcsReadMock(
   });
 }
 
-function harness(options?: { readMock?: ReturnType<typeof vi.fn> }) {
+function harness(options?: {
+  readMock?: ReturnType<typeof vi.fn>;
+  rl?: { tryConsume: () => boolean };
+}) {
   const handlers: Record<string, any> = {};
   const server = {
     registerTool: (name: string, _cfg: unknown, cb: any) => {
@@ -181,15 +188,40 @@ function harness(options?: { readMock?: ReturnType<typeof vi.fn> }) {
     logToolCall: vi.fn(),
     logToolResult: vi.fn(),
     info: vi.fn(),
+    warn: vi.fn(),
     error: vi.fn(),
     child: () => childLogger,
   };
   const logger: any = { child: () => childLogger };
-  const rateLimiter: any = { tryConsume: () => true };
+  const rateLimiter: any = options?.rl ?? { tryConsume: () => true };
   const read = options?.readMock ?? createWhmcsReadMock();
 
   registerSearchServicesTool(server as any, { read } as any, logger, rateLimiter);
-  return { handler: handlers.search_services, read };
+  return { handler: handlers.search_services, read, log: childLogger };
+}
+
+const GOV_TOKEN = 'search-consumer-token';
+
+function enableGovernance(): void {
+  mockConfig.MCP_GOVERNANCE_ENABLED = true;
+  mockConfig.MCP_ALLOW_ANON_LLM = true;
+  mockConfig.MCP_ENV = 'production';
+  process.env.MCP_CONSUMER_REGISTRY = JSON.stringify([
+    {
+      id: 'search_app',
+      token_sha256: hashToken(GOV_TOKEN),
+      defaultContract: 'billing_reconciliation',
+      allowedContracts: ['billing_reconciliation'],
+      writeCapability: 'false',
+    },
+  ]);
+  __resetRegistryCacheForTests();
+}
+
+function disableGovernance(): void {
+  mockConfig.MCP_GOVERNANCE_ENABLED = false;
+  delete process.env.MCP_CONSUMER_REGISTRY;
+  __resetRegistryCacheForTests();
 }
 
 async function invoke(handler: any, params: Record<string, unknown>) {
@@ -203,6 +235,10 @@ beforeEach(() => {
   mockConfig.MCP_ALLOWED_CLIENT_IDS = [];
   mockConfig.MCP_AUTH_TOKEN = undefined;
   mockConfig.MCP_GOVERNANCE_ENABLED = false;
+  mockConfig.MCP_ALLOW_ANON_LLM = true;
+  mockConfig.MCP_ENV = 'production';
+  mockConfig.MCP_ALLOW_CLIENT_ENRICHMENT = true;
+  disableGovernance();
 });
 
 describe('search_services — schema', () => {
@@ -233,10 +269,23 @@ describe('search_services — services view', () => {
   it('returns an error when no filters are provided without allow_broad_search', async () => {
     const { handler } = harness();
     const result = await invoke(handler, { view: 'services' });
-    expect(result).toMatchObject({
-      isError: true,
-      error: 'At least one filter is required unless allow_broad_search=true.',
+    expect(result.isError).toBe(true);
+    expect(String(result.error)).toContain('At least one native filter');
+    // Error responses carry no structuredContent (Etapa 2.4 / E5).
+    const raw = await handler({ view: 'services' });
+    expect(raw.structuredContent).toBeUndefined();
+    expect(raw.isError).toBe(true);
+  });
+
+  it('local-only filters do NOT satisfy the broad-search guard (Etapa 1.3 / E3)', async () => {
+    const { handler } = harness();
+    const result = await invoke(handler, {
+      statuses: ['Active'],
+      domain_contains: 'example',
+      view: 'services',
     });
+    expect(result.isError).toBe(true);
+    expect(String(result.error)).toContain('Local-only filters');
   });
 
   it('returns normalized services and hides credentials', async () => {
@@ -311,6 +360,8 @@ describe('search_services — services view', () => {
       domain_contains: 'example',
       view: 'services',
       limit: 10,
+      // Local-only filters require an explicit broad-search opt-in (Etapa 1.3).
+      allow_broad_search: true,
     });
     expect(result.total_matched).toBe(1);
     expect(result.items).toMatchObject([{ serviceid: 101 }]);
@@ -334,8 +385,8 @@ describe('search_services — services view', () => {
     });
   });
 
-  it('rejects fan-outs above the query combination cap', async () => {
-    const { handler } = harness();
+  it('rejects fan-outs above the cap BEFORE materializing or reading (1.2 / E2)', async () => {
+    const { handler, read } = harness();
     const result = await invoke(handler, {
       serviceids: Array.from({ length: 20 }, (_, i) => i + 1),
       domains: Array.from({ length: 20 }, (_, i) => `d${String(i)}.test`),
@@ -343,6 +394,9 @@ describe('search_services — services view', () => {
     });
     expect(result.isError).toBe(true);
     expect(String(result.error)).toContain('Narrow the array filters');
+    // 20 × 20 = 400 > 100: rejected by the preflight, so no WHMCS read fires
+    // and the cartesian product is never built.
+    expect(read).not.toHaveBeenCalled();
   });
 });
 
@@ -482,5 +536,280 @@ describe('search_services — cursor pagination', () => {
       cursor: encodeCursor(0).slice(0, 3) + '!!',
     });
     expect(result.offset).toBe(0);
+  });
+
+  it('a cursor minted for one view is rejected (reset+warn) in another view (3.3 / P3)', async () => {
+    const { handler } = harness();
+    const r1 = await invoke(handler, { clientids: [1, 2], view: 'services', limit: 2 });
+    expect(typeof r1.nextCursor).toBe('string');
+
+    // Reuse the services-view cursor under view='clients'.
+    const r2 = await invoke(handler, {
+      clientids: [1, 2],
+      view: 'clients',
+      limit: 2,
+      cursor: r1.nextCursor,
+    });
+    expect(r2.offset).toBe(0);
+    expect(r2.warnings as string[]).toEqual(
+      expect.arrayContaining([expect.stringContaining('different view')])
+    );
+  });
+});
+
+describe('search_services — rate limiting & resilient enrichment (1.1 / 1.4)', () => {
+  it('consumes a token per WHMCS page; exhausting it surfaces a rate-limit error with no structuredContent', async () => {
+    // Entry gate consumes the 1st token (true); the first product-page read
+    // consumes the 2nd (false) → RateLimitError.
+    let calls = 0;
+    const rl = {
+      tryConsume: () => {
+        calls += 1;
+        return calls <= 1;
+      },
+    };
+    const { handler } = harness({ rl });
+    const res = await handler({ serviceids: [101], view: 'services', limit: 10 });
+    const parsed = JSON.parse(res.content[0].text) as Record<string, unknown>;
+    expect(parsed.isError).toBe(true);
+    // Error path emits no structuredContent (2.4 / E5).
+    expect(res.structuredContent).toBeUndefined();
+  });
+
+  it('optional enrichment degrades gracefully when the token runs out mid-way', async () => {
+    // Allow entry (1) + one product page (2); deny the GetClientsDetails read.
+    let calls = 0;
+    const rl = {
+      tryConsume: () => {
+        calls += 1;
+        return calls <= 2;
+      },
+    };
+    const { handler } = harness({ rl });
+    const result = await invoke(handler, {
+      serviceids: [101],
+      view: 'services',
+      include_client_details: true,
+      limit: 10,
+    });
+    // Search still succeeds with the service, just without client details.
+    expect(result.isError).toBeFalsy();
+    expect((result.items as Record<string, unknown>[])[0]).toMatchObject({ serviceid: 101 });
+    expect((result.items as Record<string, unknown>[])[0]).not.toHaveProperty('client');
+    expect(result.client_details_partial).toBe(true);
+    expect(result.warnings as string[]).toEqual(
+      expect.arrayContaining([expect.stringContaining('rate limit reached')])
+    );
+  });
+});
+
+describe('search_services — multi-page scan, sort, flags', () => {
+  it('pages through multiple WHMCS pages and reports a complete scan', async () => {
+    const many: FixtureRecord[] = Array.from({ length: 250 }, (_, i) => ({
+      id: String(1000 + i),
+      clientid: '1',
+      pid: '42',
+      name: 'Bulk',
+      domain: `host${String(i)}.test`,
+      recurringamount: '5.00',
+      billingcycle: 'Monthly',
+      nextduedate: '2026-07-01',
+      status: 'Active',
+    }));
+    const read = createWhmcsReadMock(many);
+    const { handler } = harness({ readMock: read });
+
+    const result = await invoke(handler, { clientids: [1], view: 'services', limit: 100 });
+    expect(result.total_matched).toBe(250);
+    expect(result.complete_scan).toBe(true);
+    // 250 records at page size 100 ⇒ 3 product reads (100 + 100 + 50).
+    expect(read).toHaveBeenCalledTimes(3);
+  });
+
+  it('honours sort_by/sort_order', async () => {
+    const { handler } = harness();
+    const result = await invoke(handler, {
+      clientids: [1, 2],
+      view: 'services',
+      sort_by: 'serviceid',
+      sort_order: 'desc',
+      limit: 10,
+    });
+    expect((result.items as Record<string, unknown>[]).map((s) => s.serviceid)).toEqual([
+      103, 102, 101,
+    ]);
+  });
+
+  it('opt-in sections (usage/custom_fields/config_options) and name/fieldname fallback (2.3)', async () => {
+    const { handler } = harness();
+    const result = await invoke(handler, {
+      serviceids: [101],
+      view: 'services',
+      include_usage: true,
+      include_custom_fields: true,
+      include_config_options: true,
+      limit: 10,
+    });
+    const item = (result.items as Record<string, unknown>[])[0];
+    expect(item.usage).toMatchObject({ disk_usage: '5 GB', bandwidth_limit: '500 GB' });
+    expect(item.custom_fields).toMatchObject([{ id: 1, name: 'Seats', value: '25' }]);
+    expect(item.config_options).toMatchObject([{ id: 7, option: 'License Tier' }]);
+  });
+});
+
+describe('search_services — error contract (2.4 / E5)', () => {
+  it('a WHMCS business error returns content+isError with no structuredContent', async () => {
+    const readMock = vi.fn(async () => {
+      throw new WhmcsBusinessError('boom');
+    });
+    const { handler } = harness({ readMock });
+    const res = await handler({ serviceids: [101], view: 'services' });
+    expect(res.isError).toBe(true);
+    expect(res.structuredContent).toBeUndefined();
+    const parsed = JSON.parse(res.content[0].text) as Record<string, unknown>;
+    expect(parsed.error).toBe('boom');
+  });
+});
+
+describe('search_services — governed path (2.1 / 2.2 / 3.1)', () => {
+  it('services view: items are projected, credentials dropped, count===items.length', async () => {
+    enableGovernance();
+    const { handler } = harness();
+    const res = await handler({ serviceids: [101], view: 'services', auth_token: GOV_TOKEN });
+    expect(res.structuredContent).toBeDefined();
+    const sc = res.structuredContent as Record<string, any>;
+    expect(sc.contract).toBe('billing_reconciliation');
+    expect(sc.items).toHaveLength(1);
+    expect(sc.items[0]).toMatchObject({ serviceId: 101, clientId: 1 });
+    expect(sc.count).toBe(sc.items.length);
+    // username/password never cross the boundary.
+    expect(JSON.stringify(res)).not.toContain('masked-value');
+    expect(JSON.stringify(res)).not.toContain('alice');
+  });
+
+  it('clients view: governed items are ids/counts-only groups, no labels, count===items.length', async () => {
+    enableGovernance();
+    const { handler } = harness();
+    const res = await handler({ product_ids: [42, 43], view: 'clients', auth_token: GOV_TOKEN });
+    const sc = res.structuredContent as Record<string, any>;
+    expect(sc.count).toBe(sc.items.length);
+    expect(sc.items[0]).toMatchObject({ clientid: 1, serviceids: expect.any(Array) });
+    // ids/counts only: no nested services (default) and no display labels.
+    expect(sc.items[0]).not.toHaveProperty('services');
+    expect(sc.items[0]).not.toHaveProperty('product_name');
+    expect(JSON.stringify(res)).not.toContain('masked-value');
+  });
+
+  it('products view with include_group_services nests PROJECTED services per group', async () => {
+    enableGovernance();
+    const { handler } = harness();
+    const res = await handler({
+      clientids: [1, 2],
+      view: 'products',
+      include_group_services: true,
+      auth_token: GOV_TOKEN,
+    });
+    const sc = res.structuredContent as Record<string, any>;
+    expect(sc.count).toBe(sc.items.length);
+    const group = sc.items[0];
+    expect(Array.isArray(group.services)).toBe(true);
+    expect(group.services[0]).toMatchObject({ serviceId: expect.any(Number) });
+    // No display labels leak via the group summary; no credentials anywhere.
+    expect(group).not.toHaveProperty('product_name');
+    expect(JSON.stringify(res)).not.toContain('masked-value');
+  });
+
+  it('a denied token leaks no data', async () => {
+    enableGovernance();
+    const { handler } = harness();
+    const res = await handler({ serviceids: [101], view: 'services', auth_token: 'bad-token' });
+    expect(res.isError).toBe(true);
+    expect((res.structuredContent as Record<string, any>)?.items).toBeUndefined();
+    expect(JSON.stringify(res)).not.toContain('masked-value');
+    expect(JSON.stringify(res)).not.toContain('alice');
+  });
+
+  it('group view: a denied token leaks no group data', async () => {
+    enableGovernance();
+    const { handler } = harness();
+    const res = await handler({ product_ids: [42, 43], view: 'clients', auth_token: 'bad-token' });
+    expect(res.isError).toBe(true);
+    expect((res.structuredContent as Record<string, any>)?.items).toBeUndefined();
+  });
+});
+
+describe('search_services — MCP_ALLOW_CLIENT_ENRICHMENT gate (5.1)', () => {
+  it('default (enabled) enriches as before', async () => {
+    const { handler } = harness();
+    const result = await invoke(handler, {
+      serviceids: [101],
+      view: 'services',
+      include_client_details: true,
+      limit: 10,
+    });
+    expect((result.items as Record<string, unknown>[])[0]).toHaveProperty('client');
+  });
+
+  it('when disabled, include_client_details is ignored with a warning (no enrichment read)', async () => {
+    mockConfig.MCP_ALLOW_CLIENT_ENRICHMENT = false;
+    const { handler, read } = harness();
+    const result = await invoke(handler, {
+      serviceids: [101],
+      view: 'services',
+      include_client_details: true,
+      limit: 10,
+    });
+    expect((result.items as Record<string, unknown>[])[0]).not.toHaveProperty('client');
+    expect(result.warnings as string[]).toEqual(
+      expect.arrayContaining([expect.stringContaining('MCP_ALLOW_CLIENT_ENRICHMENT is disabled')])
+    );
+    // No GetClientsDetails call was made.
+    const detailCalls = read.mock.calls.filter((c) => c[0] === 'GetClientsDetails');
+    expect(detailCalls).toHaveLength(0);
+  });
+});
+
+describe('search_services — audit events (5.3)', () => {
+  it('emits a warn event when the fan-out is rejected', async () => {
+    const { handler, log } = harness();
+    await invoke(handler, {
+      serviceids: Array.from({ length: 20 }, (_, i) => i + 1),
+      domains: Array.from({ length: 20 }, (_, i) => `d${String(i)}.test`),
+      view: 'services',
+    });
+    expect(log.warn).toHaveBeenCalledWith(
+      'search_services: fan-out rejected',
+      expect.objectContaining({ combinationCount: 400 })
+    );
+  });
+
+  it('emits an info event when a broad search runs', async () => {
+    const { handler, log } = harness();
+    await invoke(handler, { view: 'services', allow_broad_search: true, limit: 10 });
+    expect(log.info).toHaveBeenCalledWith(
+      'search_services: broad search executed',
+      expect.objectContaining({ view: 'services' })
+    );
+  });
+
+  it('emits a warn event when enrichment degrades under rate limit', async () => {
+    let calls = 0;
+    const rl = {
+      tryConsume: () => {
+        calls += 1;
+        return calls <= 2;
+      },
+    };
+    const { handler, log } = harness({ rl });
+    await invoke(handler, {
+      serviceids: [101],
+      view: 'services',
+      include_client_details: true,
+      limit: 10,
+    });
+    expect(log.warn).toHaveBeenCalledWith(
+      'search_services: client enrichment degraded',
+      expect.objectContaining({ view: 'services' })
+    );
   });
 });
