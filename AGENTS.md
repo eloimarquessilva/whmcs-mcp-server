@@ -11,7 +11,7 @@ every substantive change.
 
 - **Transport:** MCP over **stdio** (Cursor, Claude Desktop, Kilo, etc.). Logs go to **stderr** only; never write to stdout except JSON-RPC.
 - **Backend:** WHMCS External API via `WhmcsClient` (`src/whmcs/`).
-- **Surface:** 61 tools (legacy WHMCS actions, list/reporting, aggregators, capability probes, controlled write-flow and non-executing planning) plus **9 resource endpoints/templates**.
+- **Surface:** 78 tools (legacy WHMCS actions, list/reporting, aggregators, capability probes, controlled write-flow and non-executing planning), **5 concrete resources**, and **9 resource templates**.
 
 ## Architecture (current)
 
@@ -85,6 +85,7 @@ Copy [.env.example](.env.example). Required: `WHMCS_API_URL`, `WHMCS_IDENTIFIER`
 | `MCP_GOVERNANCE_ENABLED`           | Opt-in projection boundary.                                                                                                                                                                               |
 | `MCP_CONSUMER_REGISTRY`            | JSON array with `token_sha256` — see [docs/reference/consumer-registry.example.md](docs/reference/consumer-registry.example.md).                                                                          |
 | `MCP_CLIENT_CUSTOM_FIELD_LABELS`   | `id:label` pairs for stable custom-field names in client output.                                                                                                                                          |
+| `MCP_ALLOW_CLIENT_ENRICHMENT`      | Permit explicit `search_services` client-identity enrichment when governance is disabled; default `true`.                                                                                                |
 | `MCP_PROD_WRITE_*` / `MCP_WRITE_*` | Production write authorizer, caps, audit/idempotency paths. `MCP_PROD_WRITE_AUTHORIZED_FILE` is the live owner-only JSON allowlist; edit it to change approved actions/scopes without restarting the MCP. |
 
 ## Scripts & verification

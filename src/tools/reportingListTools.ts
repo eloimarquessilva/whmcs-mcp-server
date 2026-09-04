@@ -496,9 +496,7 @@ export function registerReportingListTools(
           paying_only: params.paying_only,
           unique_client_count: uniqueClientIds.size,
           recurring_total_raw: Number(
-            filtered
-              .reduce((sum, s) => sum + parseNumber(s.recurringamount ?? '0'), 0)
-              .toFixed(2)
+            filtered.reduce((sum, s) => sum + parseNumber(s.recurringamount ?? '0'), 0).toFixed(2)
           ),
           estimated_monthly_recurring: Number(
             filtered.reduce((sum, s) => sum + monthlyRecurringAmount(s), 0).toFixed(2)

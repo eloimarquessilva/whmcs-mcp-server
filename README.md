@@ -278,6 +278,7 @@ cp .env.example .env
 | `MCP_READ_CACHE_ACTIONS`            | static references        | Comma-separated maximum allowlist for caching/coalescing; activity, log, and probe reads remain excluded                                                                                                                   |
 | `MCP_LARGE_REFUND_THRESHOLD`        | `1000`                   | Refunds above this amount require `confirm_large_refund: true`                                                                                                                                                             |
 | `MCP_CLIENT_CUSTOM_FIELD_LABELS`    | (empty)                  | Comma-separated `fieldId:label` overrides for client custom fields                                                                                                                                                         |
+| `MCP_ALLOW_CLIENT_ENRICHMENT`       | `true`                   | Permit explicit `search_services` client-identity enrichment when governance is disabled; set `false` to suppress enrichment                                                                                              |
 | `MCP_GOVERNANCE_ENABLED`            | `false`                  | Opt-in consumer-aware projection for reads (see [docs/design/governance.md](docs/design/governance.md))                                                                                                                    |
 | `MCP_ALLOW_ANON_LLM`                | `false`                  | Allow anonymous `llm_safe_summary` fallback when governance is on                                                                                                                                                          |
 | `MCP_CONSUMER_REGISTRY`             | (empty)                  | JSON consumer registry (`token_sha256` only — see [docs/reference/consumer-registry.example.md](docs/reference/consumer-registry.example.md))                                                                              |
@@ -369,7 +370,7 @@ cp .env.example .env
 - `list_client_orders` — Paginated per-client order list
 - `get_activity_log` — Activity log with canonical mapping when governance is enabled
 - `list_invoices` — Global invoice list for revenue/paying-client reporting
-- `list_services` — Global service list
+- `list_services` — Global service list with raw recurring totals and billing-cycle-normalized estimated monthly recurring revenue
 - `search_services` — Multi-filter service/product discovery: array filters (`serviceids`, `product_ids`, `clientids`, `domains`, `usernames`), local `statuses`/`domain_contains` filters, and paginated `services`/`clients`/`products` views
 
 ### Capability & Probes

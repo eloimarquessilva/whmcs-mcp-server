@@ -1,6 +1,6 @@
 # WHMCS MCP Server — Product, Ownership, and Operations Handoff
 
-Status: current as of 2026-09-02 (NEXUS-Sprint: fast path, version probe, broad reads/writes)
+Status: current as of 2026-09-03 (clean upstream sync: service discovery and MRR reporting)
 Canonical code: [`yashodhank/whmcs-mcp-server`](https://github.com/yashodhank/whmcs-mcp-server)
 Canonical branch: `main`
 
@@ -285,6 +285,20 @@ identity.
 
 ## Current delivery handoff
 
+The clean post-rewrite integration branch adds the read-only `search_services`
+tool for bounded cross-client service discovery and restores billing-cycle-
+normalized estimated monthly recurring revenue in `list_services`. The search
+tool preserves the existing governance boundary, client-mode allowlist,
+per-read rate limiting, bounded fan-out/scan limits, and optional client
+enrichment kill switch (`MCP_ALLOW_CLIENT_ENRICHMENT`). This source integration
+passed local build, typecheck, lint, formatting, the full Vitest suite (1,620
+passed / 19 skipped), MCP contracts, capability-catalog validation, official
+MCP conformance, and 37 Python updater tests on 2026-09-03. Native `php -l`
+remains **PENDING — GitHub CI** because PHP is not installed in the local WSL
+environment. This source integration does not change production deployment
+state; the operational checkout remains unchanged pending CI and an explicit
+release step.
+
 The approval hot-reload work, subsequent automated review fixes, operations
 handoff, artifact governance, and sanitized production write runbook are
 present on `main`. The current code includes live authorization reload, durable
@@ -404,7 +418,7 @@ self-consistent caller-rehashed plan. Multi-step drafting stops on the first
 denial and reports partial results explicitly; already-created records remain
 drafts only.
 
-The current public catalog is 61 tools, 10 prompts, 5 concrete resources, and
+The current public catalog is 78 tools, 10 prompts, 5 concrete resources, and
 9 resource templates. The additive Plan 003/005 surfaces are
 `whmcs://capabilities/v2`, `whmcs://planning/planir/v1`, four planning tools,
 and the `plan_whmcs_operation` prompt.
