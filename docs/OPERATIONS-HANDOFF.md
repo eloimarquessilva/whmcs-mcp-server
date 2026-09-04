@@ -293,11 +293,11 @@ per-read rate limiting, bounded fan-out/scan limits, and optional client
 enrichment kill switch (`MCP_ALLOW_CLIENT_ENRICHMENT`). This source integration
 passed local build, typecheck, lint, formatting, the full Vitest suite (1,620
 passed / 19 skipped), MCP contracts, capability-catalog validation, official
-MCP conformance, and 37 Python updater tests on 2026-09-03. Native `php -l`
-remains **PENDING — GitHub CI** because PHP is not installed in the local WSL
-environment. This source integration does not change production deployment
-state; the operational checkout remains unchanged pending CI and an explicit
-release step.
+MCP conformance, and 37 Python updater tests on 2026-09-03. PR #1 GitHub CI
+also passed the complete `build-test`, `mcp-conformance`, and
+`python-php-check` jobs, including native `php -l`. This source integration
+does not change production deployment state; the operational checkout remains
+unchanged pending an explicit release step.
 
 The approval hot-reload work, subsequent automated review fixes, operations
 handoff, artifact governance, and sanitized production write runbook are
