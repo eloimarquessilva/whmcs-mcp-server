@@ -200,6 +200,18 @@ const configSchema = z
       (val) => val === 'true' || val === '1',
       z.boolean().default(false)
     ),
+    // Data-minimisation knob for search_services' inline client enrichment
+    // (include_client_details, non-governed path only). Default TRUE preserves
+    // existing admin behaviour; set 'false' to make include_client_details be
+    // ignored (with a warning) so client PII is not folded into search rows.
+    // NOT a security barrier — admins still reach PII via get_client_details and
+    // governance ON remains the real control. Distinguishes unset (⇒ true) from
+    // an explicit 'false', since the repo's default-false preprocess collapses
+    // an unset value to false.
+    MCP_ALLOW_CLIENT_ENRICHMENT: z.preprocess(
+      (val) => (val === undefined || val === '' ? true : val === 'true' || val === '1'),
+      z.boolean().default(true)
+    ),
     // ── Phase G+ controlled production write enablement ─────────────────────
     // ALL default to the SEALED posture: empty prod allowlist + zero caps +
     // kill switch off + empty durable paths (in-memory). With no env set,

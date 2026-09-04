@@ -9027,6 +9027,230 @@
         "openWorldHint": true,
         "readOnlyHint": true
       },
+      "description": "Multi-filter discovery/lookup over WHMCS client services/products via GetClientsProducts (read-only). Prefer the cheaper tool when you can: use list_client_services when you already know the clientid, and list_client_invoices for billing. Reach for search_services for cross-client discovery — reverse lookup by domain/username, batch lookups by serviceids/product_ids, or grouping by client/product. Pass arrays such as product_ids, clientids, serviceids, domains, or usernames to search multiple values in one call; statuses and domain_contains filter locally. view='services' pages service rows; view='clients'/'products' page GROUPS (ids + counts), adding nested service rows only when include_group_services=true. Page with limit/offset or the opaque nextCursor (cursor is view-specific). Note: pagination is stateless — each page re-runs the fan-out and local scan, so prefer a larger limit over many small pages. Version: v1",
+      "execution": {
+        "taskSupport": "forbidden"
+      },
+      "inputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {
+          "allow_broad_search": {
+            "default": false,
+            "description": "Required when no primary filters are provided. Prevents accidental full scans.",
+            "type": "boolean"
+          },
+          "auth_token": {
+            "description": "MCP auth token",
+            "type": "string"
+          },
+          "clientids": {
+            "description": "One or more WHMCS client IDs. Maps to GetClientsProducts clientid.",
+            "items": {
+              "exclusiveMinimum": 0,
+              "maximum": 9007199254740991,
+              "type": "integer"
+            },
+            "maxItems": 100,
+            "minItems": 1,
+            "type": "array"
+          },
+          "contract": {
+            "description": "Requested data contract (honoured only if the resolved consumer permits it)",
+            "type": "string"
+          },
+          "cursor": {
+            "description": "Opaque pagination cursor from a prior response's nextCursor; pages forward through ALL matched results. When set it overrides offset.",
+            "type": "string"
+          },
+          "domain_contains": {
+            "description": "Case-insensitive local contains filter for service domain.",
+            "minLength": 1,
+            "type": "string"
+          },
+          "domains": {
+            "description": "Exact domain filters. Maps to GetClientsProducts domain.",
+            "items": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "maxItems": 100,
+            "minItems": 1,
+            "type": "array"
+          },
+          "include_client_details": {
+            "default": false,
+            "description": "When true, adds basic client identity fields to returned services/groups for the current page. Ignored when governance is enabled.",
+            "type": "boolean"
+          },
+          "include_config_options": {
+            "default": false,
+            "type": "boolean"
+          },
+          "include_custom_fields": {
+            "default": false,
+            "type": "boolean"
+          },
+          "include_group_services": {
+            "default": false,
+            "description": "Group views only ('clients'/'products'): when true, nest the full (or projected) service rows inside each group. Default false returns each group as ids and counts (serviceids[]) without the nested services, keeping the payload small.",
+            "type": "boolean"
+          },
+          "include_server": {
+            "default": true,
+            "type": "boolean"
+          },
+          "include_usage": {
+            "default": false,
+            "type": "boolean"
+          },
+          "limit": {
+            "default": 50,
+            "description": "Number of result items returned in this MCP response. The item type depends on view.",
+            "maximum": 100,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "offset": {
+            "default": 0,
+            "description": "Offset into the final aggregated result, in units of the selected view.",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "product_ids": {
+            "description": "One or more WHMCS product IDs. Maps to GetClientsProducts pid.",
+            "items": {
+              "exclusiveMinimum": 0,
+              "maximum": 9007199254740991,
+              "type": "integer"
+            },
+            "maxItems": 100,
+            "minItems": 1,
+            "type": "array"
+          },
+          "serviceids": {
+            "description": "One or more WHMCS service IDs. Maps to GetClientsProducts serviceid.",
+            "items": {
+              "exclusiveMinimum": 0,
+              "maximum": 9007199254740991,
+              "type": "integer"
+            },
+            "maxItems": 100,
+            "minItems": 1,
+            "type": "array"
+          },
+          "sort_by": {
+            "default": "serviceid",
+            "enum": [
+              "serviceid",
+              "clientid",
+              "product_id",
+              "next_due_date",
+              "status"
+            ],
+            "type": "string"
+          },
+          "sort_order": {
+            "default": "asc",
+            "enum": [
+              "asc",
+              "desc"
+            ],
+            "type": "string"
+          },
+          "statuses": {
+            "description": "Service statuses. Not a native WHMCS filter; applied locally after fetching.",
+            "items": {
+              "enum": [
+                "Pending",
+                "Active",
+                "Suspended",
+                "Terminated",
+                "Cancelled",
+                "Fraud"
+              ],
+              "type": "string"
+            },
+            "minItems": 1,
+            "type": "array"
+          },
+          "usernames": {
+            "description": "Exact username filters. Maps to GetClientsProducts username2.",
+            "items": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "maxItems": 100,
+            "minItems": 1,
+            "type": "array"
+          },
+          "view": {
+            "default": "services",
+            "description": "Response shape and pagination unit: 'services' pages service rows, 'clients' pages client groups, 'products' pages product groups.",
+            "enum": [
+              "services",
+              "clients",
+              "products"
+            ],
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "name": "search_services",
+      "outputSchema": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": {},
+        "properties": {
+          "consumer": {
+            "type": "string"
+          },
+          "contract": {
+            "type": "string"
+          },
+          "count": {
+            "type": "number"
+          },
+          "items": {
+            "items": {
+              "additionalProperties": {},
+              "propertyNames": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "limit": {
+            "type": "number"
+          },
+          "nextCursor": {
+            "type": "string"
+          },
+          "offset": {
+            "type": "number"
+          },
+          "total": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "items",
+          "total",
+          "count",
+          "offset",
+          "limit"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": true,
+        "readOnlyHint": true
+      },
       "description": "Sync domain status and expiry date with the registrar. NOTE: WHMCS performs domain sync via cron; there is no external API endpoint. Version: v1",
       "execution": {
         "taskSupport": "forbidden"

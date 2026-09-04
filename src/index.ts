@@ -27,6 +27,7 @@ import { registerDomainTools } from './tools/domains.js';
 import { registerSupportTools } from './tools/support.js';
 import { registerListTools } from './tools/listTools.js';
 import { registerReportingListTools } from './tools/reportingListTools.js';
+import { registerSearchServicesTool } from './tools/searchServicesTool.js';
 import { registerInfraTools } from './tools/infraTools.js';
 import { registerContactsTools } from './tools/contactsTools.js';
 import { registerBillingReadTools } from './tools/billingReadTools.js';
@@ -94,6 +95,7 @@ export function buildServer(deps: {
   registerSupportTools(server, whmcsClient, logger, rateLimiter);
   registerListTools(server, whmcsClient, logger, rateLimiter);
   registerReportingListTools(server, whmcsClient, logger, rateLimiter);
+  registerSearchServicesTool(server, whmcsClient, logger, rateLimiter);
   registerInfraTools(server, whmcsClient, logger, rateLimiter);
   registerContactsTools(server, whmcsClient, logger, rateLimiter);
   registerBillingReadTools(server, whmcsClient, logger, rateLimiter);

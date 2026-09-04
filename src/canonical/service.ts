@@ -67,7 +67,8 @@ function mapOne(src: Record<string, unknown>): CanonicalService {
   const customFields: CanonicalCustomField[] = listOf(src.customfields, 'customfield').map(
     (cf) => ({
       id: num(cf, 'id') ?? null,
-      name: str(cf, 'fieldname') ?? null,
+      // WHMCS uses `name` on some endpoints and `fieldname` on others (G3).
+      name: str(cf, 'name') ?? str(cf, 'fieldname') ?? null,
       value: str(cf, 'value') ?? null,
     })
   );
